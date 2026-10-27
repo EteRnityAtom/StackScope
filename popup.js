@@ -1104,6 +1104,39 @@ function extractUrls(text, base) {
   return [...found];
 }
 
+// Framework-agnostic SPA route-table extraction. Routers across React Router,
+// Vue Router, Angular, Ember, SvelteKit, Remix, etc. all declare routes as
+// quoted path strings in a few shared shapes: a `path:` property, a
+// <Route path="..."> element, or a route("...") helper. These client-side
+// routes never appear as <a href> or fetch() calls, so without this the app's
+// real navigable surface is invisible. Returns {path, dynamic} entries.
+function extractSpaRoutes(text) {
+  const routes = new Map();
+  const consider = raw => {
+    const value = String(raw || "").trim();
+    if (!value || value.length > 200 || /\s/.test(value)) return;
+    if (/^(?:https?:|#|\.|mailto:|tel:|data:|javascript:|\/\/)/i.test(value)) return;
+    const normalized = value.startsWith("/") ? value : `/${value}`;
+    if (!/^\/[A-Za-z0-9_~\-.:*{}()?+=&%/[\]]*$/.test(normalized)) return;
+    if (/\.(?:m?js|cjs|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|otf|eot|map|json|txt|xml|mp4|webm|pdf|wasm)$/i.test(normalized.split("?")[0])) return;
+    const dynamic = /[:*?+]|\{[^}]*\}|\[[^\]]*\]|\.\.\./.test(normalized);
+    if (!routes.has(normalized)) routes.set(normalized, { path: normalized, dynamic });
+  };
+  for (const match of text.matchAll(/\bpath\s*:\s*["'`]([^"'`]{0,200})["'`]/g)) consider(match[1]);
+  for (const match of text.matchAll(/<Route\b[^>]*\bpath=["']([^"']{0,200})["']/gi)) consider(match[1]);
+  for (const match of text.matchAll(/\broute\s*\(\s*["'`]([^"'`]{0,200})["'`]/gi)) consider(match[1]);
+  return [...routes.values()].slice(0, 2000);
+}
+
+function extractRouteParamNames(path) {
+  const names = [];
+  for (const match of String(path || "").matchAll(/[:{]\s*([A-Za-z_][\w]*)|\[\.{0,3}([A-Za-z_][\w.]*)\]/g)) {
+    const name = match[1] || match[2];
+    if (name) names.push(name.replace(/\..*$/, ""));
+  }
+  return names;
+}
+
 function extractSitemapLocations(text, base) {
   const found = new Set();
   for (const match of String(text || "").matchAll(/<loc\b[^>]*>([\s\S]*?)<\/loc\s*>/gi)) {
@@ -2758,6 +2791,7 @@ async function scan(permissionRequest) {
     const pages = [];
     const routeCandidates = [];
     const routeCandidateKeys = new Set();
+    const spaRouteParamNames = new Set();
     const requestIssues = [];
     const formActions = [];
     const formActionKeys = new Set();
@@ -3031,6 +3065,13 @@ async function scan(permissionRequest) {
       }
       for (const url of extractUrls(text, discoveryBase)) {
         if (!nonGetTargets.has(url)) enqueueDiscoveredUrl(url, depth + 1, discoveryBase);
+      }
+      for (const route of extractSpaRoutes(text)) {
+        for (const name of extractRouteParamNames(route.path)) spaRouteParamNames.add(name.slice(0, 80));
+        if (route.dynamic) { rememberRouteCandidate(route.path, discoveryBase, "SPA client-side route (template)"); continue; }
+        const absolute = cleanUrl(route.path, origin);
+        if (absolute && scope(absolute)) enqueue(absolute, depth + 1, "page", discoveryBase, false, discoveryBase);
+        else rememberRouteCandidate(route.path, discoveryBase, "SPA client-side route");
       }
     };
     for (const seed of seeds) enqueue(seed.url, seed.depth, seed.kind);
@@ -3546,6 +3587,7 @@ async function scan(permissionRequest) {
     for (const endpoint of uniqueEndpoints) for (const name of endpoint.parameters || []) addParameterReview(name, endpoint.url, "API query");
     for (const page of uniquePages) for (const name of page.parameters || []) addParameterReview(name, page.url, "Page query");
     for (const field of inputFields) addParameterReview(field.name, field.action || field.page, `Form ${field.method} field`);
+    for (const name of spaRouteParamNames) addParameterReview(name, `${origin}/ (SPA route)`, "SPA route param");
     const observedTraffic = trafficRecord?.origin === origin && trafficRecord?.mode === mode && trafficRecord?.modulePath === modulePath
       ? (trafficRecord.items || []).slice(-TRAFFIC_ITEM_LIMIT).map(item => ({
         url: reportUrl(item.url), method: String(item.method || "GET").toUpperCase(), status: Number(item.status) || 0,
