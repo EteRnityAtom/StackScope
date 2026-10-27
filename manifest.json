@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "StackScope — Scoped Web Recon",
+  "version": "1.1.10",
+  "description": "Scoped web app reconnaissance, user-driven API observation, and framework-specific security test planning for authorized assessments.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_title": "StackScope",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icons/icon48.png"
+    }
+  },
+  "icons": {
+    "48": "icons/icon48.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "stackscope@example.local",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  }
+}

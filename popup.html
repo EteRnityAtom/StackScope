@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StackScope</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="mark" aria-hidden="true">SS</div>
+    <div>
+      <h1>StackScope</h1>
+      <p>Scoped reconnaissance for authorized testing</p>
+    </div>
+  </header>
+
+  <section class="scope">
+    <label for="scopeMode">Scan scope</label>
+    <select id="scopeMode">
+      <option value="module">Module and its subpaths</option>
+      <option value="site">Whole current origin</option>
+    </select>
+
+    <label for="modulePath">Module path</label>
+    <input id="modulePath" placeholder="/portal/ or /account/" autocomplete="off" spellcheck="false">
+    <p class="hint">Use an origin-relative path. Page routes stay at this path or below it. Same-origin scripts and API endpoints referenced by those pages may use paths elsewhere on the same origin.</p>
+
+    <label for="assetOrigins">Additional authorized JavaScript asset origins (optional)</label>
+    <input id="assetOrigins" placeholder="https://assets.example.com" autocomplete="off" spellcheck="false">
+    <p class="hint">Enter exact origins only, separated by commas. Firefox will request access for each one. Only JavaScript and source maps are fetched from these hosts; page routes and API checks remain on the active origin.</p>
+
+    <label for="importAliases">JavaScript import aliases (optional)</label>
+    <input id="importAliases" placeholder="@/=/src/; ~/=/src/" autocomplete="off" spellcheck="false">
+    <p class="hint">Map a bare import prefix to an origin-relative script path, separated by semicolons. Import maps in the page are read automatically.</p>
+
+    <label for="apiPrefixes">Additional API path prefixes (optional)</label>
+    <input id="apiPrefixes" placeholder="/portal/data/; /mobile/orders/" autocomplete="off" spellcheck="false">
+    <p class="hint">Use exact origin-relative prefixes for app-specific API routes that do not contain words such as api, graphql, or v1. Requests remain on the active origin.</p>
+
+    <div class="row">
+      <label class="check"><input type="checkbox" id="crawlJs" checked> Crawl JavaScript files</label>
+      <label class="check"><input type="checkbox" id="only200" checked> Show only HTTP 200 API responses</label>
+    </div>
+    <label class="check opt-in"><input type="checkbox" id="checkAnonymous"> Compare discovered routes without cookies (authorized scope only)</label>
+    <label for="anonymousLimit">Maximum anonymous checks</label>
+    <input id="anonymousLimit" type="number" min="1" max="2000" value="250" disabled>
+    <p id="anonymousNotice" class="hint">Only enable this for hostnames and paths explicitly allowed by the bug-bounty scope. It sends bounded same-origin GET requests with credentials omitted, records status/metadata only, and does not save response bodies. GET can still have side effects.</p>
+
+    <label for="maxPages">Maximum URLs to request (pages, scripts, and routes)</label>
+    <input id="maxPages" type="number" min="10" max="5000" value="1000">
+    <p class="hint">The cap applies to page, endpoint, and script requests together. Raise it for larger apps; pages stay in the selected module path, while supporting scripts and APIs stay on the active origin.</p>
+
+    <label for="scanDeadlineMinutes">Maximum total scan time (minutes)</label>
+    <input id="scanDeadlineMinutes" type="number" min="1" max="30" value="10">
+    <p class="hint">There is no link or JavaScript recursion-depth cutoff. The URL budget, total-time deadline, and server rate-limit responses keep the scan bounded.</p>
+
+    <label>Observe module API traffic</label>
+    <div class="row"><button id="startObserver" class="secondary">Start click observer</button><button id="stopObserver" class="secondary" disabled>Stop observer</button></div>
+    <p id="observerNotice" class="hint">After selecting a module path above, start this observer, close the popup, and click through the app. It records same-origin method, redacted URL, status, duration, selected response-header metadata, and supported request parameter names. It never stores or sends parameter values or response bodies, and does not replay requests.</p>
+    <label class="check opt-in"><input type="checkbox" id="compareObservedGets"> Also compare observed GETs without cookies</label>
+    <p class="hint">Opt-in sends one same-origin GET without cookies for each unique eligible GET your page makes, up to 1,000 requests. It skips credential-like URLs and state-changing route names. GET can still have side effects; non-GET methods are observed but never replayed.</p>
+
+    <p class="notice">Use only for an authorized assessment. Normal requests ask Firefox to include same-origin browser credentials; StackScope never reads or exports cookie/token values. Apps using bearer tokens in local storage may not have an authenticated baseline. Anonymous GET comparison runs only when you opt in above. No exploit payloads are sent, and GET requests can still have side effects.</p>
+    <button id="start">Fingerprint and crawl</button>
+    <button id="stop" class="secondary" disabled>Stop scan</button>
+  </section>
+
+  <section id="status" aria-live="polite">Open an authorized HTTP/HTTPS page, choose a scope, then start.</section>
+
+  <section id="results" hidden>
+    <nav aria-label="Scan results">
+      <button data-tab="summary" class="tab active">Summary</button>
+      <button data-tab="pages" class="tab">URLs</button>
+      <button data-tab="endpoints" class="tab">Endpoints</button>
+      <button data-tab="modules" class="tab">Modules</button>
+      <button data-tab="inputs" class="tab">Inputs / params</button>
+      <button data-tab="tech" class="tab">Tech</button>
+      <button data-tab="js" class="tab">JS audit</button>
+      <button data-tab="anonymous" class="tab">Anon check</button>
+      <button data-tab="tests" class="tab">Test ideas</button>
+    </nav>
+    <div id="panel"></div>
+    <div id="reportDecision" class="actions" hidden>
+      <p class="notice">Keep this report on this device, or discard its temporary copy. Unsaved reports are cleared when reopened after 24 hours.</p>
+      <div class="row"><button id="saveReport">Save report</button><button id="discardReport" class="secondary">Discard</button></div>
+    </div>
+    <div class="actions"><button id="export" class="secondary">Export JSON report</button></div>
+    <div class="actions"><label for="importReport">Import JSON report</label><input id="importReport" type="file" accept="application/json,.json"></div>
+  </section>
+
+  <section id="reportHistory" class="scope history" hidden>
+    <h2>Saved reports</h2>
+    <select id="historySelect" aria-label="Saved recon reports"></select>
+    <div class="row"><button id="openSaved" class="secondary">Open</button><button id="deleteSaved" class="secondary">Delete</button></div>
+  </section>
+
+  <section id="trafficResults" class="scope history" hidden>
+    <h2>Observed API traffic</h2>
+    <p id="trafficStatus" class="hint"></p>
+    <div class="row"><button id="clearTraffic" class="secondary">Clear observed data</button></div>
+    <div id="trafficList"></div>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>
