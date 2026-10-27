@@ -55,7 +55,25 @@ const secretValuePatterns = [
   ["JSON Web Token", /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, 0],
   ["Private key block", /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/g, 0],
   ["Basic-auth credentials in URL", /\bhttps?:\/\/[A-Za-z0-9._~%+-]+:[^\/\s:@"'`]{3,}@/g, 0],
-  ["Generic secret assignment", /\b(?:api[_-]?key|apikey|secret|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|password|passwd)["']?\s*[:=]\s*["']([^"'`\s]{12,100})["']/gi, 1]
+  ["Generic secret assignment", /\b(?:api[_-]?key|apikey|secret|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|password|passwd)["']?\s*[:=]\s*["']([^"'`\s]{12,100})["']/gi, 1],
+  // Additional providers
+  ["GCP service account JSON", /"type"\s*:\s*"service_account"/g, 0],
+  ["GCP service account key id", /"private_key_id"\s*:\s*"([a-f0-9]{40})"/gi, 1],
+  ["Azure storage connection string", /DefaultEndpointsProtocol=https?;AccountName=[A-Za-z0-9]+;AccountKey=[A-Za-z0-9+/=]{40,}/g, 0],
+  ["Azure AD client secret", /\b[A-Za-z0-9~._\-]{3}8Q~[A-Za-z0-9~._\-]{34}\b/g, 0],
+  ["Twilio API key (SK)", /\bSK[0-9a-fA-F]{32}\b/g, 0],
+  ["Mailgun API key", /\bkey-[0-9a-f]{32}\b/g, 0],
+  ["npm access token", /\bnpm_[A-Za-z0-9]{36}\b/g, 0],
+  ["PyPI upload token", /\bpypi-AgEIcHlwaS[A-Za-z0-9_\-]{50,}\b/g, 0],
+  ["Square access token", /\b(?:sq0atp-|EAAA)[A-Za-z0-9_\-]{22,}\b/g, 0],
+  ["Shopify access token", /\bshp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}\b/g, 0],
+  ["Database connection string", /\b(?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|redis|amqp):\/\/[^\s"'`<>]{6,200}/gi, 0],
+  // Internal infrastructure disclosure (shown unmasked — the value is the finding, not a credential)
+  ["Internal RFC1918 IP", /\b(?:10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b/g, 0, false],
+  ["Internal hostname", /\b[a-z0-9][a-z0-9.\-]{1,60}\.(?:internal|local|corp|intra|intranet|lan)\b/gi, 0, false],
+  ["S3 bucket reference", /\b(?:s3:\/\/[a-z0-9.\-]{3,63}|[a-z0-9.\-]{3,63}\.s3(?:[.\-][a-z0-9\-]+)?\.amazonaws\.com|s3(?:[.\-][a-z0-9\-]+)?\.amazonaws\.com\/[a-z0-9.\-]{3,63})\b/gi, 0, false],
+  ["Google Cloud Storage bucket", /\b(?:gs:\/\/[a-z0-9._\-]{3,63}|storage\.googleapis\.com\/[a-z0-9._\-]{3,63})\b/gi, 0, false],
+  ["Azure Blob storage URL", /\bhttps?:\/\/[a-z0-9]{3,24}\.blob\.core\.windows\.net\b/gi, 0, false]
 ];
 
 function maskSecretValue(value) {
@@ -66,7 +84,7 @@ function maskSecretValue(value) {
 
 function extractSecretFindings(text, sourceUrl, findings, seen, limit = 500) {
   const body = String(text || "");
-  for (const [label, pattern, group] of secretValuePatterns) {
+  for (const [label, pattern, group, mask = true] of secretValuePatterns) {
     pattern.lastIndex = 0;
     let match;
     while (findings.length < limit && (match = pattern.exec(body)) !== null) {
@@ -77,8 +95,46 @@ function extractSecretFindings(text, sourceUrl, findings, seen, limit = 500) {
       const key = `${sourceUrl}|${label}|${captured.slice(0, 32)}|${line}`;
       if (seen.has(key)) { if (match.index === pattern.lastIndex) pattern.lastIndex += 1; continue; }
       seen.add(key);
-      findings.push({ type: label, value: maskSecretValue(captured), source: sourceUrl, line });
+      findings.push({ type: label, value: mask ? maskSecretValue(captured) : captured.slice(0, 200), source: sourceUrl, line });
       if (match.index === pattern.lastIndex) pattern.lastIndex += 1;
+    }
+  }
+}
+
+// Passive DOM-XSS taint hints: flag dangerous sinks in fetched JS, and raise
+// the severity when a known taint source appears in the same statement. These
+// are static heuristics — review leads, not confirmed vulnerabilities.
+const taintSinkRe = /(\.innerHTML|\.outerHTML|insertAdjacentHTML|document\.write(?:ln)?|[^.\w]eval|new Function|dangerouslySetInnerHTML|\.insertAdjacentHTML|\$\([^)]*\)\.html|\.setAttribute)\s*[({=]/g;
+const taintSourceRe = /location\.(?:href|search|hash|pathname|hostname)|(?:window|document)\.location|document\.(?:URL|documentURI|referrer|cookie|baseURI)|window\.name|URLSearchParams|localStorage\.getItem|sessionStorage\.getItem|(?:\bevent|\be|\bmsg)\.data|postMessage/;
+function extractTaintHints(text, sourceUrl, hints, seen, limit = 100) {
+  const body = String(text || "");
+  let sinkSeen = false;
+  let sourceSeen = false;
+  let directSeen = false;
+  taintSinkRe.lastIndex = 0;
+  let match;
+  while (hints.length < limit && (match = taintSinkRe.exec(body)) !== null) {
+    sinkSeen = true;
+    const sink = match[1].replace(/^[^.\w]/, "").trim();
+    // Confine the source search to the same statement (up to the first ; or
+    // newline) so a source from an adjacent statement is not misattributed.
+    const statement = body.slice(match.index, match.index + 240).split(/[\n;]/)[0];
+    const sourceMatch = statement.match(taintSourceRe);
+    if (!sourceMatch) continue;
+    directSeen = true;
+    let line = 1;
+    for (let i = 0; i < match.index && i < body.length; i += 1) if (body.charCodeAt(i) === 10) line += 1;
+    const snippet = statement.replace(/\s+/g, " ").trim().slice(0, 160);
+    const key = `${sourceUrl}|${sink}|${sourceMatch[0]}|${line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    hints.push({ sink, source: sourceMatch[0], severity: "high", snippet, url: sourceUrl, line });
+  }
+  if (!directSeen) {
+    sourceSeen = taintSourceRe.test(body);
+    if (sinkSeen && sourceSeen) {
+      const key = `${sourceUrl}|cooccurrence`;
+      if (!seen.has(key)) { seen.add(key); hints.push({ sink: "(multiple)", source: "(elsewhere in file)", severity: "low", snippet: "A DOM sink and a tainted source both appear in this file but no direct flow was matched statically.", url: sourceUrl, line: 0 }); }
     }
   }
 }
@@ -1172,25 +1228,73 @@ function corsVerdict(testedOrigin, acao, acac) {
   return { level: "info", label: `Access-Control-Allow-Origin: ${allowOrigin}${allowCreds ? " with credentials" : ""}` };
 }
 
-function buildSecurityAudit(headers, origin) {
-  const get = name => headers?.[name.toLowerCase()];
+// Parse a Content-Security-Policy value and flag weak directives.
+function analyzeCsp(csp) {
+  const value = String(csp || "").trim();
+  if (!value) return [];
+  const directives = {};
+  for (const part of value.split(";")) {
+    const segment = part.trim();
+    if (!segment) continue;
+    const pieces = segment.split(/\s+/);
+    directives[pieces[0].toLowerCase()] = pieces.slice(1).join(" ").toLowerCase();
+  }
+  const findings = [];
+  const scriptSrc = directives["script-src"] ?? directives["default-src"] ?? "";
+  if (/'unsafe-inline'/.test(scriptSrc)) findings.push({ severity: "high", header: "Content-Security-Policy", note: "script-src allows 'unsafe-inline' — inline-script XSS is not mitigated." });
+  if (/'unsafe-eval'/.test(scriptSrc)) findings.push({ severity: "medium", header: "Content-Security-Policy", note: "script-src allows 'unsafe-eval'." });
+  if (/(?:^|\s)\*(?:\s|$)/.test(scriptSrc) || /(?:^|\s)https?:(?:\s|$)/.test(scriptSrc)) findings.push({ severity: "high", header: "Content-Security-Policy", note: "script-src uses a wildcard or scheme-wide source — any host can serve scripts." });
+  if (/(?:^|\s)data:/.test(scriptSrc)) findings.push({ severity: "high", header: "Content-Security-Policy", note: "script-src allows data: URIs — a common CSP bypass." });
+  if (!("object-src" in directives) && !("default-src" in directives)) findings.push({ severity: "low", header: "Content-Security-Policy", note: "No object-src/default-src — plugin content is unrestricted." });
+  if (!("base-uri" in directives)) findings.push({ severity: "low", header: "Content-Security-Policy", note: "No base-uri — <base> injection can hijack relative URLs." });
+  if (!("frame-ancestors" in directives)) findings.push({ severity: "low", header: "Content-Security-Policy", note: "No frame-ancestors — framing protection relies on X-Frame-Options alone." });
+  return findings;
+}
+
+// Per-response security-header audit. `responses` is [{url, headers, csp}];
+// missing-header findings are aggregated across all responses (with example
+// URLs) so site-wide gaps collapse to one row while per-URL deviations still
+// surface, and each distinct CSP is content-analyzed.
+function buildSecurityAudit(responses, origin) {
+  const list = Array.isArray(responses) ? responses.filter(item => item && item.headers) : [];
   const isHttps = String(origin || "").startsWith("https:");
   const findings = [];
-  const add = (severity, header, note) => findings.push({ severity, header, note });
-  if (!get("content-security-policy")) add("medium", "Content-Security-Policy", "No CSP on the primary response; review XSS and framing defenses.");
-  if (isHttps && !get("strict-transport-security")) add("medium", "Strict-Transport-Security", "No HSTS on an HTTPS origin; connections can be downgraded.");
-  if (!get("x-frame-options") && !/frame-ancestors/i.test(String(get("content-security-policy") || ""))) add("low", "X-Frame-Options", "No framing protection (X-Frame-Options or CSP frame-ancestors); review clickjacking exposure.");
-  if (!/nosniff/i.test(String(get("x-content-type-options") || ""))) add("low", "X-Content-Type-Options", "Missing nosniff; browsers may MIME-sniff responses.");
-  if (!get("referrer-policy")) add("low", "Referrer-Policy", "No Referrer-Policy; full URLs may leak to third parties.");
-  const acao = get("access-control-allow-origin");
-  const acac = String(get("access-control-allow-credentials") || "").toLowerCase() === "true";
-  if (acao === "*" && acac) add("high", "Access-Control-Allow-Origin", "Wildcard ACAO sent with credentials:true (invalid but a strong misconfiguration signal).");
-  else if (acao === "*") add("medium", "Access-Control-Allow-Origin", "Wildcard ACAO exposes non-credentialed responses to any origin.");
-  const server = get("server");
-  const powered = get("x-powered-by");
-  if (server && /\d/.test(server)) add("info", "Server", `Version disclosure: ${server}`);
-  if (powered) add("info", "X-Powered-By", `Technology disclosure: ${powered}`);
-  return findings;
+  const seen = new Set();
+  const add = (severity, header, note) => { const key = `${header}|${note}`; if (seen.has(key)) return; seen.add(key); findings.push({ severity, header, note }); };
+  const missing = { "Content-Security-Policy": [], "Strict-Transport-Security": [], "X-Frame-Options": [], "X-Content-Type-Options": [], "Referrer-Policy": [] };
+  const cspSeen = new Set();
+  for (const item of list) {
+    const get = name => item.headers[name.toLowerCase()];
+    if (!get("content-security-policy")) missing["Content-Security-Policy"].push(item.url);
+    else if (item.csp && !cspSeen.has(item.csp)) { cspSeen.add(item.csp); for (const finding of analyzeCsp(item.csp)) add(finding.severity, finding.header, finding.note); }
+    if (isHttps && !get("strict-transport-security")) missing["Strict-Transport-Security"].push(item.url);
+    if (!get("x-frame-options") && !(item.csp && /frame-ancestors/i.test(item.csp))) missing["X-Frame-Options"].push(item.url);
+    if (!/nosniff/i.test(String(get("x-content-type-options") || ""))) missing["X-Content-Type-Options"].push(item.url);
+    if (!get("referrer-policy")) missing["Referrer-Policy"].push(item.url);
+    const acao = get("access-control-allow-origin");
+    const acac = String(get("access-control-allow-credentials") || "").toLowerCase() === "true";
+    if (acao === "*" && acac) add("high", "Access-Control-Allow-Origin", "Wildcard ACAO sent with credentials:true (invalid but a strong misconfiguration signal).");
+    else if (acao === "*") add("medium", "Access-Control-Allow-Origin", "Wildcard ACAO exposes non-credentialed responses to any origin.");
+    const server = get("server");
+    if (server && /\d/.test(server)) add("info", "Server", `Version disclosure: ${server}`);
+    const powered = get("x-powered-by");
+    if (powered) add("info", "X-Powered-By", `Technology disclosure: ${powered}`);
+    const generator = get("x-generator");
+    if (generator) add("info", "X-Generator", `Technology disclosure: ${generator}`);
+  }
+  const severityOf = { "Content-Security-Policy": "medium", "Strict-Transport-Security": "medium", "X-Frame-Options": "low", "X-Content-Type-Options": "low", "Referrer-Policy": "low" };
+  const noteOf = {
+    "Content-Security-Policy": "No CSP; review XSS and framing defenses.",
+    "Strict-Transport-Security": "No HSTS on an HTTPS response; connections can be downgraded.",
+    "X-Frame-Options": "No framing protection (X-Frame-Options or CSP frame-ancestors); clickjacking risk.",
+    "X-Content-Type-Options": "Missing nosniff; browsers may MIME-sniff responses.",
+    "Referrer-Policy": "No Referrer-Policy; full URLs may leak to third parties."
+  };
+  for (const [header, urls] of Object.entries(missing)) {
+    if (!urls.length) continue;
+    add(severityOf[header], header, `${noteOf[header]} Missing on ${urls.length} response(s), e.g. ${urls.slice(0, 3).join(", ")}`);
+  }
+  return findings.slice(0, 100);
 }
 
 function looksLikeHtmlDocument(bodyText) {
@@ -2943,6 +3047,7 @@ async function scan(permissionRequest) {
     let externalScriptReferences = 0;
     const textCorpus = [];
     const headersBag = {};
+    let primaryCsp = "";
     let corpusChars = 0;
     let requestCount = 0;
     const scanDeadline = Date.now() + Math.max(60_000, Math.min(30 * 60_000, (Number($("scanDeadlineMinutes")?.value) || 10) * 60_000));
@@ -2961,6 +3066,8 @@ async function scan(permissionRequest) {
     const scriptIndicatorKeys = new Set();
     const secretFindings = [];
     const secretFindingKeys = new Set();
+    const taintHints = [];
+    const taintHintKeys = new Set();
     // Content-hash dedup: skip the secret/indicator scan on a body already
     // scanned under another URL (SPA fallback routing serves identical HTML for
     // many routes). URL/endpoint discovery is never skipped. Mirrors the Go
@@ -3134,6 +3241,7 @@ async function scan(permissionRequest) {
     const analyzeScriptText = (text, sourceUrl, depth, discoveryBase = current.href, skipSecrets = false) => {
       if (!crawlJs || !text) return;
       if (!skipSecrets) scanText(text, sourceUrl);
+      if (!isLikelyVendorFile(sourceUrl)) extractTaintHints(text, sourceUrl, taintHints, taintHintKeys);
       const importPattern = /(?:import\s*(?:[^"'`]*?from\s*)?|import\s*\(|export\s+[^"'`]*?from\s*|require\s*\()\s*["'`]([^"'`]+)["'`]/g;
       let match;
       while ((match = importPattern.exec(text)) !== null) {
@@ -3303,9 +3411,10 @@ async function scan(permissionRequest) {
         const isScript = item.kind === "js" || /(?:javascript|ecmascript)/i.test(contentType) || /\.(?:m?js|cjs)(?:[?#]|$)/i.test(finalUrl);
         const isSourceMap = /\.map(?:[?#]|$)/i.test(finalUrl);
         const headers = responseHeaders(response.headers);
+        const rawCsp = (response.headers.get("content-security-policy") || "").slice(0, 8000);
         const rawLength = response.headers.get("content-length");
         const declaredBytes = /^\d+$/.test(rawLength || "") ? Number(rawLength) : null;
-        if (isHtml && item.kind === "page" && (item.url === current.href || Object.keys(headersBag).length === 0)) Object.assign(headersBag, headers);
+        if (isHtml && item.kind === "page" && (item.url === current.href || Object.keys(headersBag).length === 0)) { Object.assign(headersBag, headers); primaryCsp = rawCsp; }
         const readable = contentType.includes("text/html") || contentType.includes("javascript") || contentType.includes("ecmascript") || contentType.includes("json") || contentType.startsWith("text/") || isScript;
         const sniffUnknownType = !contentType && !isScript;
         let body = "";
@@ -3340,7 +3449,7 @@ async function scan(permissionRequest) {
         if (item.kind !== "js" && usefulEndpoint && (!only200 || response.status === 200)) {
           endpointRecord = {
             url: finalUrl, status: response.status, type: contentType || "unknown", kind: item.kind, depth: item.depth,
-            bytes: effectiveBytes, byteSource, sizeComplete, parameters: getQueryParameterNames(finalUrl), headers
+            bytes: effectiveBytes, byteSource, sizeComplete, parameters: getQueryParameterNames(finalUrl), headers, csp: rawCsp
           };
           endpoints.push(endpointRecord);
         }
@@ -3350,7 +3459,7 @@ async function scan(permissionRequest) {
 
         if (isHtml && item.kind === "page") {
           const pageType = contentType || "text/html (body detected)";
-          const pageRecord = { url: reportUrl(finalUrl), status: response.status, type: pageType, depth: item.depth, bytes: effectiveBytes, byteSource, sizeComplete, parameters: getQueryParameterNames(finalUrl), headers };
+          const pageRecord = { url: reportUrl(finalUrl), status: response.status, type: pageType, depth: item.depth, bytes: effectiveBytes, byteSource, sizeComplete, parameters: getQueryParameterNames(finalUrl), headers, csp: rawCsp };
           pages.push(pageRecord);
           if (collectBaselines) pageBaselines.push({ url: finalUrl, status: response.status, type: pageType, depth: item.depth, bytes: effectiveBytes, byteSource, sizeComplete, headers, kind: "page" });
         }
@@ -3704,7 +3813,12 @@ async function scan(permissionRequest) {
         if (corsTest) { try { await browser.runtime.sendMessage({ type: "stackscope:cors-config", active: false }); } catch (_) { /* background already idle */ } }
       }
     }
-    const securityAudit = buildSecurityAudit(headersBag, origin);
+    const auditResponses = [
+      { url: `${origin}/ (primary)`, headers: headersBag, csp: primaryCsp },
+      ...pages.map(entry => ({ url: entry.url, headers: entry.headers, csp: entry.csp })),
+      ...endpoints.map(entry => ({ url: reportUrl(entry.url), headers: entry.headers, csp: entry.csp }))
+    ];
+    const securityAudit = buildSecurityAudit(auditResponses, origin);
 
     const uniqueEndpoints = [...new Map(endpoints.map(entry => [reportUrl(entry.url), { ...entry, url: reportUrl(entry.url) }])).values()]
       .sort((a, b) => a.url.localeCompare(b.url));
@@ -3815,6 +3929,7 @@ async function scan(permissionRequest) {
       jsFiles: [...new Set([...scriptUrls].map(reportUrl))].sort(),
       scriptIndicators,
       secretFindings,
+      taintHints,
       methodProbes,
       corsFindings,
       securityAudit,
@@ -3982,7 +4097,7 @@ function sanitizeStoredReport(rawReport) {
     "id", "createdAt", "origin", "scope", "stats", "fingerprints", "headers", "pages", "routeCandidates",
     "transportEndpoints", "formActions", "nonGetCallSites", "graphqlOperations", "technologyVersions", "requestIssues",
     "unresolvedImports", "uiModules", "inputFields", "parameterReviews", "routeTestIdeas", "reconChecklist", "observedTraffic",
-    "externalScriptHosts", "jsFiles", "scriptIndicators", "secretFindings", "auth", "methodProbes", "corsFindings", "securityAudit", "endpoints", "anonymousChecks", "anonymousPageChecks",
+    "externalScriptHosts", "jsFiles", "scriptIndicators", "secretFindings", "taintHints", "auth", "methodProbes", "corsFindings", "securityAudit", "endpoints", "anonymousChecks", "anonymousPageChecks",
     "withheldRequests", "testIdeas", "limitations"
   ];
   report = Object.fromEntries(allowedFields.filter(key => Object.prototype.hasOwnProperty.call(report, key)).map(key => [key, report[key]]));
@@ -4235,8 +4350,13 @@ function sanitizeStoredReport(rawReport) {
     keyword: text(item.keyword, 100), source: authorizedAssetOrText(item.source), line: count(item.line)
   }));
   report.secretFindings = objectList(report.secretFindings).map(item => ({
-    type: text(item.type, 100), value: text(item.value, 120), source: authorizedAssetOrText(item.source), line: count(item.line)
+    type: text(item.type, 100), value: text(item.value, 220), source: authorizedAssetOrText(item.source), line: count(item.line)
   })).slice(0, 500);
+  report.taintHints = objectList(report.taintHints).map(item => ({
+    sink: text(item.sink, 60), source: text(item.source, 60),
+    severity: ["high", "low"].includes(item.severity) ? item.severity : "low",
+    snippet: text(item.snippet, 200), url: authorizedAssetOrText(item.url), line: count(item.line)
+  })).slice(0, 300);
   const rawAuth = isRecord(report.auth) ? report.auth : {};
   report.auth = {
     tokenUsed: Boolean(rawAuth.tokenUsed),
@@ -4560,8 +4680,10 @@ function render(tabName) {
     const indicators = report.scriptIndicators || [];
     const unresolved = report.unresolvedImports || [];
     const secrets = report.secretFindings || [];
-    const secretsCard = `<div class="card"><h3>Possible secrets in JavaScript</h3><p class="muted">High-signal credential patterns found in analyzed JavaScript. Values are masked (first/last characters only); open the source at the given line to confirm. A match is a lead, not proof — verify before reporting.</p>${secrets.length ? secrets.map(item => `<div class="idea"><span class="pill warn">${escapeHtml(item.type)}</span><code>${escapeHtml(item.value)}</code><p class="endpoint">${escapeHtml(item.source)} · line ${item.line}</p></div>`).join("") : "No high-signal secret patterns were found in analyzed script text."}</div>`;
-    panel.innerHTML = `<div class="card"><h3>Recursive JavaScript crawl</h3><p>${report.stats.jsFilesDiscovered || 0} JavaScript/source-map files fetched within the request cap.</p><p class="muted">The crawler follows inline scripts, authorized scripts, import maps, configured aliases, dynamic script references, and recursive imports. API/page requests remain on the active origin.</p>${report.jsFiles.map(url => `<div class="endpoint">${escapeHtml(url)}</div>`).join("") || "No authorized JavaScript files were fetched."}${report.externalScriptHosts?.length ? `<p class="muted">Unapproved external script hosts excluded: ${report.externalScriptHosts.map(escapeHtml).join(", ")}</p>` : ""}${unresolved.length ? `<h4>Unresolved import specifiers</h4>${unresolved.map(item => `<div class="idea"><code>${escapeHtml(item.specifier)}</code><div class="endpoint">${escapeHtml(item.source)}</div><small>${escapeHtml(item.reason)}</small></div>`).join("")}` : ""}</div>${secretsCard}<div class="card"><h3>Sensitive keyword indicators</h3><p class="muted">Only keyword names, source locations, and line numbers are kept. Matched values are never shown or saved; a keyword is not proof of a secret.</p>${indicators.length ? indicators.map(item => `<div class="idea"><b>${escapeHtml(item.keyword)}</b><p class="endpoint">${escapeHtml(item.source)} · line ${item.line}</p></div>`).join("") : "No configured keyword indicators found in analyzed script text."}</div>`;
+    const taint = report.taintHints || [];
+    const secretsCard = `<div class="card"><h3>Possible secrets in JavaScript</h3><p class="muted">High-signal patterns plus ~780 vendor signatures and a Shannon-entropy scan. Credential values are masked; infrastructure disclosures (internal IPs/hosts/buckets) are shown in full. A match is a lead, not proof — verify before reporting.</p>${secrets.length ? secrets.map(item => `<div class="idea"><span class="pill warn">${escapeHtml(item.type)}</span><code>${escapeHtml(item.value)}</code><p class="endpoint">${escapeHtml(item.source)} · line ${item.line}</p></div>`).join("") : "No secret patterns were found in analyzed script text."}</div>`;
+    const taintCard = `<div class="card"><h3>DOM-XSS taint hints</h3><p class="muted">Dangerous sinks (innerHTML, eval, document.write, setAttribute…) found in JavaScript. "High" means a taint source (location, postMessage, storage…) appears in the same statement. Static heuristic — confirm the data flow manually.</p>${taint.length ? taint.map(item => `<div class="idea"><span class="pill ${item.severity === "high" ? "warn" : ""}">${escapeHtml(item.severity.toUpperCase())}</span><b>${escapeHtml(item.sink)}</b> ← <code>${escapeHtml(item.source)}</code><p><code>${escapeHtml(item.snippet)}</code></p><p class="endpoint">${escapeHtml(item.url)}${item.line ? " · line " + item.line : ""}</p></div>`).join("") : "No DOM-XSS sink/source patterns were found in analyzed script text."}</div>`;
+    panel.innerHTML = `<div class="card"><h3>Recursive JavaScript crawl</h3><p>${report.stats.jsFilesDiscovered || 0} JavaScript/source-map files fetched within the request cap.</p><p class="muted">The crawler follows inline scripts, authorized scripts, import maps, configured aliases, dynamic script references, and recursive imports. API/page requests remain on the active origin.</p>${report.jsFiles.map(url => `<div class="endpoint">${escapeHtml(url)}</div>`).join("") || "No authorized JavaScript files were fetched."}${report.externalScriptHosts?.length ? `<p class="muted">Unapproved external script hosts excluded: ${report.externalScriptHosts.map(escapeHtml).join(", ")}</p>` : ""}${unresolved.length ? `<h4>Unresolved import specifiers</h4>${unresolved.map(item => `<div class="idea"><code>${escapeHtml(item.specifier)}</code><div class="endpoint">${escapeHtml(item.source)}</div><small>${escapeHtml(item.reason)}</small></div>`).join("")}` : ""}</div>${secretsCard}${taintCard}<div class="card"><h3>Sensitive keyword indicators</h3><p class="muted">Only keyword names, source locations, and line numbers are kept. Matched values are never shown or saved; a keyword is not proof of a secret.</p>${indicators.length ? indicators.map(item => `<div class="idea"><b>${escapeHtml(item.keyword)}</b><p class="endpoint">${escapeHtml(item.source)} · line ${item.line}</p></div>`).join("") : "No configured keyword indicators found in analyzed script text."}</div>`;
   } else if (tabName === "anonymous") {
     const checks = report.anonymousChecks || [];
     const pageChecks = report.anonymousPageChecks || [];
