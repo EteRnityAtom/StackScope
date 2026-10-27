@@ -1000,6 +1000,28 @@ function isActionableAnonymousComparison(item) {
   return item.selectedHeadersMatch === false || typeDiffers || sizeDiffers;
 }
 
+// Explicit access-control verdict for an authenticated-vs-anonymous comparison.
+// "session" is the authenticated request (cookies, plus the opt-in bearer token
+// when enabled); "anonymous" is the no-cookie/no-token request. Bodies are never
+// inspected, so every verdict is a manual-review lead, not a confirmed finding.
+function anonymousAccessVerdict(item) {
+  if (!item || typeof item !== "object") return { level: "inconclusive", label: "Inconclusive" };
+  const sessionStatus = Number(item.sessionStatus);
+  const anonymousStatus = Number(item.anonymousStatus);
+  const successfulSession = Number.isFinite(sessionStatus) && sessionStatus >= 200 && sessionStatus < 300;
+  const outcome = String(item.outcome || "");
+  if (successfulSession && /redirected to (?:a )?(?:same-origin )?login\/auth route/i.test(outcome)) return { level: "protected", label: "Protected: redirects to login without auth" };
+  if (successfulSession && [401, 403].includes(anonymousStatus)) return { level: "protected", label: `Protected: returns HTTP ${anonymousStatus} without auth` };
+  if (!successfulSession || anonymousStatus !== 200) return { level: "inconclusive", label: "Inconclusive" };
+  if (isHtmlDocument(item.sessionType) || isHtmlDocument(item.anonymousType)) return { level: "inconclusive", label: "Inconclusive: HTML response" };
+  const typeDiffers = normalizedMediaType(item.sessionType) !== normalizedMediaType(item.anonymousType);
+  const sessionBytes = Number(item.sessionBytes);
+  const anonymousBytes = Number(item.anonymousBytes);
+  const sizeDiffers = Number.isFinite(sessionBytes) && Number.isFinite(anonymousBytes) && sessionBytes !== anonymousBytes;
+  if (!typeDiffers && !sizeDiffers && item.selectedHeadersMatch !== false) return { level: "public", label: "Reachable without authentication — same response as authenticated" };
+  return { level: "review", label: "Responds without auth, metadata differs — review" };
+}
+
 function looksLikeHtmlDocument(bodyText) {
   const prefix = String(bodyText || "").slice(0, 4096).replace(/^\uFEFF/, "").replace(/^(?:\s|<!--[\s\S]*?-->)+/, "");
   return /^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b|<main\b|<div\b|<form\b)/i.test(prefix);
@@ -2539,17 +2561,18 @@ function findTokenInObject(value, depth = 0) {
 function pickAuthToken(entries) {
   if (!Array.isArray(entries)) return null;
   const jwt = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
-  const tokenKey = /(?:^|[._-])(?:access[._-]?token|id[._-]?token|auth[._-]?token|authorization|jwt|bearer|token|session[._-]?token)(?:$|[._-])/i;
-  const opaque = /^[A-Za-z0-9._\-]{20,}$/;
+  const tokenKey = /(?:^|[._:-])(?:access[._-]?token|id[._-]?token|auth[._-]?token|authorization|jwt|bearer|token|session[._-]?token|apitoken)(?:$|[._:-])/i;
+  const opaque = /^[A-Za-z0-9._~+/=-]{20,}$/;
+  const stripBearer = value => value.replace(/^Bearer\s+/i, "").trim();
   const candidates = [];
   for (const entry of entries) {
     const key = String(entry?.key || "");
-    const value = String(entry?.value || "").trim();
+    const value = stripBearer(String(entry?.value || "").trim());
     if (!value) continue;
     if (jwt.test(value)) { candidates.push({ token: value, source: `${entry.store}.${key}`, kind: "jwt" }); continue; }
     if (/^[\[{]/.test(value)) {
       try {
-        const found = findTokenInObject(JSON.parse(value));
+        const found = stripBearer(String(findTokenInObject(JSON.parse(value)) || ""));
         if (found) { candidates.push({ token: found, source: `${entry.store}.${key} (json)`, kind: jwt.test(found) ? "jwt" : "opaque" }); continue; }
       } catch (_) { /* value is not JSON */ }
     }
@@ -4153,11 +4176,18 @@ function render(tabName) {
       : report.stats.stopped && checks.length === 0 && pageChecks.length === 0
         ? "<div class=\"card\"><h3>Anonymous comparison stopped</h3><p>The scan was stopped before no-cookie checks began.</p></div>"
         : "";
-    const apiRows = usefulApiChecks.map(item => `<div class="card"><div class="endpoint">${escapeHtml(item.url)}</div><p>Browser session: HTTP ${item.sessionStatus} · Without cookies: HTTP ${item.anonymousStatus}</p><p class="muted">${escapeHtml(item.outcome)}</p>${item.anonymousRedirectTarget ? `<p class="muted">Same-origin redirect target: ${escapeHtml(item.anonymousRedirectTarget)}</p>` : ""}<p class="muted">${escapeHtml(item.sessionType || "unknown")} → ${escapeHtml(item.anonymousType || "unknown")} · ${sizeLabel(item.sessionBytes, item.sessionByteSource)} → ${sizeLabel(item.anonymousBytes, item.anonymousByteSource)}${item.sizeComplete === false ? " · size may be partial" : ""} · selected headers ${item.selectedHeadersMatch === true ? "match" : item.selectedHeadersMatch === false ? "differ" : "not compared"}</p></div>`).join("");
-    const pageRows = usefulPageChecks.map(item => `<div class="card"><div class="endpoint">${escapeHtml(item.url)}</div><p>Page: HTTP ${item.sessionStatus} · Without cookies: ${item.anonymousStatus === null ? "no readable response" : `HTTP ${item.anonymousStatus}`}</p><p class="muted">${escapeHtml(item.outcome)}</p>${item.anonymousRedirectTarget ? `<p class="muted">Same-origin redirect target: ${escapeHtml(item.anonymousRedirectTarget)}</p>` : ""}<p class="muted">${escapeHtml(item.sessionType || "unknown")} → ${escapeHtml(item.anonymousType || "unknown")} · ${sizeLabel(item.sessionBytes, item.sessionByteSource)} → ${sizeLabel(item.anonymousBytes, item.anonymousByteSource)} · selected headers ${item.selectedHeadersMatch === true ? "match" : item.selectedHeadersMatch === false ? "differ" : "not compared"}</p></div>`).join("");
+    const verdictPill = item => {
+      const verdict = anonymousAccessVerdict(item);
+      const cls = verdict.level === "protected" ? "good" : verdict.level === "public" || verdict.level === "review" ? "warn" : "";
+      return `<span class="pill ${cls}">${escapeHtml(verdict.label)}</span>`;
+    };
+    const noAuthCount = [...usefulApiChecks, ...usefulPageChecks].filter(item => anonymousAccessVerdict(item).level === "public").length;
+    const authNote = `<div class="card"><h3>Authenticated vs. no-auth access test</h3><p class="muted">Each row compares the authenticated request (${report.auth?.tokenUsed ? "cookies + page-storage bearer token" : "browser cookies"}) with the same request sent with no cookies and no token. A verdict of "reachable without authentication" means the unauthenticated request returned the same non-HTML response — a strong broken-access-control lead. Bodies are not inspected, so confirm manually.</p><p><b>${noAuthCount}</b> endpoint(s)/route(s) appear reachable without authentication.</p></div>`;
+    const apiRows = usefulApiChecks.map(item => `<div class="card">${verdictPill(item)}<div class="endpoint">${escapeHtml(item.url)}</div><p>Browser session: HTTP ${item.sessionStatus} · Without cookies: HTTP ${item.anonymousStatus}</p><p class="muted">${escapeHtml(item.outcome)}</p>${item.anonymousRedirectTarget ? `<p class="muted">Same-origin redirect target: ${escapeHtml(item.anonymousRedirectTarget)}</p>` : ""}<p class="muted">${escapeHtml(item.sessionType || "unknown")} → ${escapeHtml(item.anonymousType || "unknown")} · ${sizeLabel(item.sessionBytes, item.sessionByteSource)} → ${sizeLabel(item.anonymousBytes, item.anonymousByteSource)}${item.sizeComplete === false ? " · size may be partial" : ""} · selected headers ${item.selectedHeadersMatch === true ? "match" : item.selectedHeadersMatch === false ? "differ" : "not compared"}</p></div>`).join("");
+    const pageRows = usefulPageChecks.map(item => `<div class="card">${verdictPill(item)}<div class="endpoint">${escapeHtml(item.url)}</div><p>Page: HTTP ${item.sessionStatus} · Without cookies: ${item.anonymousStatus === null ? "no readable response" : `HTTP ${item.anonymousStatus}`}</p><p class="muted">${escapeHtml(item.outcome)}</p>${item.anonymousRedirectTarget ? `<p class="muted">Same-origin redirect target: ${escapeHtml(item.anonymousRedirectTarget)}</p>` : ""}<p class="muted">${escapeHtml(item.sessionType || "unknown")} → ${escapeHtml(item.anonymousType || "unknown")} · ${sizeLabel(item.sessionBytes, item.sessionByteSource)} → ${sizeLabel(item.anonymousBytes, item.anonymousByteSource)} · selected headers ${item.selectedHeadersMatch === true ? "match" : item.selectedHeadersMatch === false ? "differ" : "not compared"}</p></div>`).join("");
     panel.innerHTML = !report.scope.checkAnonymous || (report.stats.stopped && checks.length === 0 && pageChecks.length === 0)
       ? emptyMessage
-       : `<div class="card"><h3>Without-cookie checks</h3><p class="muted">GET requests use credentials omitted. Only a login redirect, an authentication status after a successful browser-session response, or a non-HTML 200 response with different metadata is shown. Identical responses, HTML shells, unavailable checks, and comparisons without a successful browser-session baseline are hidden as inconclusive. Raw header values and response bodies are not shown.</p><p>${stats.anonymousRequestsAttempted || 0} requests sent · ${pageChecks.length} page routes checked · ${checks.length} API responses checked · ${usefulPageChecks.length} page-route leads shown · ${usefulApiChecks.length} API leads shown · ${Math.max(0, pageChecks.length - usefulPageChecks.length)} page results hidden · ${Math.max(0, checks.length - usefulApiChecks.length)} API results hidden${report.stats.stopped ? " · stopped early" : ""}</p></div><div class="card"><h3>Page route results</h3>${pageRows || "No actionable page-route result. HTML shells and ambiguous or unavailable checks were hidden."}</div><div class="card"><h3>API endpoint checks</h3>${apiRows || "No actionable API access-control difference. Ambiguous or unavailable checks were hidden."}</div>`;
+       : `<div class="card"><h3>Without-cookie checks</h3><p class="muted">GET requests use credentials omitted. Only a login redirect, an authentication status after a successful browser-session response, or a non-HTML 200 response with different metadata is shown. Identical responses, HTML shells, unavailable checks, and comparisons without a successful browser-session baseline are hidden as inconclusive. Raw header values and response bodies are not shown.</p><p>${stats.anonymousRequestsAttempted || 0} requests sent · ${pageChecks.length} page routes checked · ${checks.length} API responses checked · ${usefulPageChecks.length} page-route leads shown · ${usefulApiChecks.length} API leads shown · ${Math.max(0, pageChecks.length - usefulPageChecks.length)} page results hidden · ${Math.max(0, checks.length - usefulApiChecks.length)} API results hidden${report.stats.stopped ? " · stopped early" : ""}</p></div>${authNote}<div class="card"><h3>Page route results</h3>${pageRows || "No actionable page-route result. HTML shells and ambiguous or unavailable checks were hidden."}</div><div class="card"><h3>API endpoint checks</h3>${apiRows || "No actionable API access-control difference. Ambiguous or unavailable checks were hidden."}</div>`;
   } else {
     const baseRouteIdeas = report.routeTestIdeas || [];
     const liveRoutes = observedItems.map(item => ({ url: reportUrl(item.url), method: item.method }));
