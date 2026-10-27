@@ -42,6 +42,9 @@
       <label class="check"><input type="checkbox" id="crawlJs" checked> Crawl JavaScript files</label>
       <label class="check"><input type="checkbox" id="only200" checked> Show only HTTP 200 API responses</label>
     </div>
+    <label class="check opt-in"><input type="checkbox" id="useStoredToken"> Use bearer token from page storage for the authenticated crawl</label>
+    <p class="hint">Reads localStorage/sessionStorage of the active tab to find a JWT or token-like value and sends it as an <code>Authorization: Bearer</code> header on the authenticated crawl. The token value is never shown or saved; only its storage key is recorded. Enable only for apps you are authorized to test.</p>
+
     <label class="check opt-in"><input type="checkbox" id="checkAnonymous"> Compare discovered routes without cookies (authorized scope only)</label>
     <label for="anonymousLimit">Maximum anonymous checks</label>
     <input id="anonymousLimit" type="number" min="1" max="2000" value="250" disabled>

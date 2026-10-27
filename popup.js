@@ -38,6 +38,51 @@ function collectSensitiveIndicators(text, sourceUrl, indicators, seen, limit = 1
   }
 }
 
+// High-signal secret/credential value patterns. Unlike collectSensitiveIndicators
+// (which records only a keyword name), this captures the matched value so an
+// authorized tester can confirm a real leak. Values are masked before storage.
+const secretValuePatterns = [
+  ["AWS access key ID", /\bAKIA[0-9A-Z]{16}\b/g, 0],
+  ["AWS secret access key", /\baws_secret_access_key\s*[:=]\s*["']?([A-Za-z0-9/+]{40})\b/gi, 1],
+  ["Google API key", /\bAIza[0-9A-Za-z_\-]{35}\b/g, 0],
+  ["Google OAuth client secret", /\bGOCSPX-[0-9A-Za-z_\-]{20,}\b/g, 0],
+  ["Slack token", /\bxox[baprs]-[0-9A-Za-z-]{10,48}\b/g, 0],
+  ["Stripe secret key", /\bsk_live_[0-9A-Za-z]{16,}\b/g, 0],
+  ["Stripe restricted key", /\brk_live_[0-9A-Za-z]{16,}\b/g, 0],
+  ["GitHub token", /\bgh[pousr]_[0-9A-Za-z]{36,}\b/g, 0],
+  ["Twilio account SID", /\bAC[0-9a-fA-F]{32}\b/g, 0],
+  ["SendGrid key", /\bSG\.[0-9A-Za-z_\-]{22}\.[0-9A-Za-z_\-]{43}\b/g, 0],
+  ["JSON Web Token", /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, 0],
+  ["Private key block", /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/g, 0],
+  ["Basic-auth credentials in URL", /\bhttps?:\/\/[A-Za-z0-9._~%+-]+:[^\/\s:@"'`]{3,}@/g, 0],
+  ["Generic secret assignment", /\b(?:api[_-]?key|apikey|secret|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|password|passwd)["']?\s*[:=]\s*["']([^"'`\s]{12,100})["']/gi, 1]
+];
+
+function maskSecretValue(value) {
+  const raw = String(value || "");
+  if (raw.length <= 8) return `${raw.slice(0, 2)}${"*".repeat(Math.max(0, raw.length - 2))}`;
+  return `${raw.slice(0, 4)}…${raw.slice(-4)} (${raw.length} chars)`;
+}
+
+function extractSecretFindings(text, sourceUrl, findings, seen, limit = 500) {
+  const body = String(text || "");
+  for (const [label, pattern, group] of secretValuePatterns) {
+    pattern.lastIndex = 0;
+    let match;
+    while (findings.length < limit && (match = pattern.exec(body)) !== null) {
+      const captured = (group && match[group] ? match[group] : match[0]) || "";
+      if (!captured) { if (match.index === pattern.lastIndex) pattern.lastIndex += 1; continue; }
+      let line = 1;
+      for (let i = 0; i < match.index && i < body.length; i += 1) if (body.charCodeAt(i) === 10) line += 1;
+      const key = `${sourceUrl}|${label}|${captured.slice(0, 32)}|${line}`;
+      if (seen.has(key)) { if (match.index === pattern.lastIndex) pattern.lastIndex += 1; continue; }
+      seen.add(key);
+      findings.push({ type: label, value: maskSecretValue(captured), source: sourceUrl, line });
+      if (match.index === pattern.lastIndex) pattern.lastIndex += 1;
+    }
+  }
+}
+
 function assertActiveTargetUnchanged(tab) {
   if (!tab?.id) return;
   if (popupOpenedTabId !== null && tab.id !== popupOpenedTabId) {
@@ -2478,7 +2523,79 @@ function isMainWorldObserverActive() {
   return Boolean(window.__stackscopePassiveObserver_v118?.active || window.__stackscopeEarlyObserver_v118?.active);
 }
 
-async function scan() {
+function findTokenInObject(value, depth = 0) {
+  if (!value || typeof value !== "object" || depth > 4) return null;
+  const jwt = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
+  const tokenKey = /(?:access|id|auth|refresh)?[._-]?token$|^authorization$|^jwt$|^bearer$|^accesstoken$|^idtoken$/i;
+  for (const [key, child] of Object.entries(value)) {
+    if (typeof child === "string" && child && (jwt.test(child.trim()) || (tokenKey.test(key) && child.trim().length >= 20))) return child.trim();
+  }
+  for (const child of Object.values(value)) {
+    if (child && typeof child === "object") { const found = findTokenInObject(child, depth + 1); if (found) return found; }
+  }
+  return null;
+}
+
+function pickAuthToken(entries) {
+  if (!Array.isArray(entries)) return null;
+  const jwt = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
+  const tokenKey = /(?:^|[._-])(?:access[._-]?token|id[._-]?token|auth[._-]?token|authorization|jwt|bearer|token|session[._-]?token)(?:$|[._-])/i;
+  const opaque = /^[A-Za-z0-9._\-]{20,}$/;
+  const candidates = [];
+  for (const entry of entries) {
+    const key = String(entry?.key || "");
+    const value = String(entry?.value || "").trim();
+    if (!value) continue;
+    if (jwt.test(value)) { candidates.push({ token: value, source: `${entry.store}.${key}`, kind: "jwt" }); continue; }
+    if (/^[\[{]/.test(value)) {
+      try {
+        const found = findTokenInObject(JSON.parse(value));
+        if (found) { candidates.push({ token: found, source: `${entry.store}.${key} (json)`, kind: jwt.test(found) ? "jwt" : "opaque" }); continue; }
+      } catch (_) { /* value is not JSON */ }
+    }
+    if (tokenKey.test(key) && opaque.test(value)) candidates.push({ token: value, source: `${entry.store}.${key}`, kind: "opaque" });
+  }
+  const best = candidates.find(item => item.kind === "jwt") || candidates[0];
+  if (!best) return null;
+  return { headerName: "Authorization", headerValue: `Bearer ${best.token}`, source: best.source, kind: best.kind };
+}
+
+async function captureAuthTokenFromPage(tabId) {
+  if (!tabId || !browser.scripting?.executeScript) return null;
+  try {
+    const results = await browser.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const out = [];
+        const read = (store, name) => {
+          try {
+            for (let index = 0; index < store.length && out.length < 500; index += 1) {
+              const key = store.key(index);
+              let value = "";
+              try { value = store.getItem(key) || ""; } catch (_) { continue; }
+              if (value) out.push({ store: name, key, value: value.slice(0, 8192) });
+            }
+          } catch (_) { /* storage access blocked */ }
+        };
+        try { read(window.localStorage, "localStorage"); } catch (_) { /* unavailable */ }
+        try { read(window.sessionStorage, "sessionStorage"); } catch (_) { /* unavailable */ }
+        return out;
+      }
+    });
+    return pickAuthToken(results?.[0]?.result || []);
+  } catch (_) { return null; }
+}
+
+function buildScanPermissionOrigins() {
+  const snapshot = activeTabSnapshot;
+  if (!snapshot?.url || !/^https?:/i.test(snapshot.url)) throw new Error("Open an HTTP/HTTPS target tab first.");
+  const current = new URL(snapshot.url);
+  const assetOrigins = parseAuthorizedAssetOrigins($("assetOrigins").value, current.origin);
+  const permissionOrigin = `${current.protocol}//${current.hostname}/*`;
+  return [permissionOrigin, ...assetOrigins.map(assetOrigin => `${new URL(assetOrigin).protocol}//${new URL(assetOrigin).hostname}/*`)];
+}
+
+async function scan(permissionRequest) {
   stopRequested = false;
   lastReport = null;
   $("start").disabled = true;
@@ -2505,8 +2622,16 @@ async function scan() {
     const apiPrefixes = parseApiPrefixes($("apiPrefixes").value);
     const permissionOrigin = `${current.protocol}//${current.hostname}/*`;
     const requestedOrigins = [permissionOrigin, ...assetOrigins.map(assetOrigin => `${new URL(assetOrigin).protocol}//${new URL(assetOrigin).hostname}/*`)];
-    const granted = await browser.permissions.request({ origins: requestedOrigins });
+    // permissions.request must be invoked from the user gesture, so the click
+    // handler starts it and passes the pending promise here. Fall back to a
+    // direct request only when the scan was started programmatically.
+    const granted = permissionRequest ? await permissionRequest : await browser.permissions.request({ origins: requestedOrigins });
     if (!granted) throw new Error("Site access was not granted, so no crawl requests were made.");
+
+    const useStoredToken = $("useStoredToken")?.checked || false;
+    const capturedToken = useStoredToken ? await captureAuthTokenFromPage(tab.id) : null;
+    const crawlHeaders = capturedToken ? { [capturedToken.headerName]: capturedToken.headerValue } : {};
+    if (useStoredToken) $("status").textContent = capturedToken ? `Using bearer token from ${capturedToken.source} for the authenticated crawl…` : "No bearer token found in page storage; crawling with cookies only…";
 
     const scope = url => isInScope(url, origin, mode, modulePath);
     const sameOrigin = url => isSameOriginUrl(url, origin);
@@ -2571,6 +2696,8 @@ async function scan() {
     let live = { html: "", inlineScripts: [], importMaps: [], links: [], scripts: [], resources: [], htmlHints: [], uiModules: [], inputFields: [], formActions: [] };
     const scriptIndicators = [];
     const scriptIndicatorKeys = new Set();
+    const secretFindings = [];
+    const secretFindingKeys = new Set();
     const addScriptUrl = url => {
       if (scriptUrls.size < maxPages) scriptUrls.add(url);
     };
@@ -2720,6 +2847,7 @@ async function scan() {
     const analyzeScriptText = (text, sourceUrl, depth, discoveryBase = current.href) => {
       if (!crawlJs || !text) return;
       collectSensitiveIndicators(text, sourceUrl, scriptIndicators, scriptIndicatorKeys);
+      extractSecretFindings(text, sourceUrl, secretFindings, secretFindingKeys);
       const importPattern = /(?:import\s*(?:[^"'`]*?from\s*)?|import\s*\(|export\s+[^"'`]*?from\s*|require\s*\()\s*["'`]([^"'`]+)["'`]/g;
       let match;
       while ((match = importPattern.exec(text)) !== null) {
@@ -2853,7 +2981,7 @@ async function scan() {
       const requestTimeout = setTimeout(() => requestController.abort(), 15_000);
       try {
         // GET only. Redirects are inspected manually so only an in-scope target can be queued.
-        const response = await fetch(item.url, { method: "GET", credentials: "include", redirect: "manual", cache: "no-store", signal: requestController.signal });
+        const response = await fetch(item.url, { method: "GET", credentials: "include", headers: crawlHeaders, redirect: "manual", cache: "no-store", signal: requestController.signal });
         if (response.status >= 300 && response.status < 400 || response.type === "opaqueredirect") {
           const location = response.headers?.get?.("location") || "";
           const redirectTarget = location ? cleanUrl(location, item.url) : null;
@@ -3303,6 +3431,8 @@ async function scan() {
       externalScriptHosts: [...externalScriptHosts].sort(),
       jsFiles: [...new Set([...scriptUrls].map(reportUrl))].sort(),
       scriptIndicators,
+      secretFindings,
+      auth: { tokenUsed: Boolean(capturedToken), tokenSource: capturedToken?.source || null, tokenKind: capturedToken?.kind || null, headerName: capturedToken?.headerName || null },
       endpoints: uniqueEndpoints,
       anonymousChecks,
       anonymousPageChecks: uniqueAnonymousPageChecks,
@@ -3464,7 +3594,7 @@ function sanitizeStoredReport(rawReport) {
     "id", "createdAt", "origin", "scope", "stats", "fingerprints", "headers", "pages", "routeCandidates",
     "transportEndpoints", "formActions", "nonGetCallSites", "graphqlOperations", "technologyVersions", "requestIssues",
     "unresolvedImports", "uiModules", "inputFields", "parameterReviews", "routeTestIdeas", "reconChecklist", "observedTraffic",
-    "externalScriptHosts", "jsFiles", "scriptIndicators", "endpoints", "anonymousChecks", "anonymousPageChecks",
+    "externalScriptHosts", "jsFiles", "scriptIndicators", "secretFindings", "auth", "endpoints", "anonymousChecks", "anonymousPageChecks",
     "withheldRequests", "testIdeas", "limitations"
   ];
   report = Object.fromEntries(allowedFields.filter(key => Object.prototype.hasOwnProperty.call(report, key)).map(key => [key, report[key]]));
@@ -3712,6 +3842,16 @@ function sanitizeStoredReport(rawReport) {
   report.scriptIndicators = objectList(report.scriptIndicators).map(item => ({
     keyword: text(item.keyword, 100), source: authorizedAssetOrText(item.source), line: count(item.line)
   }));
+  report.secretFindings = objectList(report.secretFindings).map(item => ({
+    type: text(item.type, 100), value: text(item.value, 120), source: authorizedAssetOrText(item.source), line: count(item.line)
+  })).slice(0, 500);
+  const rawAuth = isRecord(report.auth) ? report.auth : {};
+  report.auth = {
+    tokenUsed: Boolean(rawAuth.tokenUsed),
+    tokenSource: text(rawAuth.tokenSource, 200),
+    tokenKind: ["jwt", "opaque"].includes(rawAuth.tokenKind) ? rawAuth.tokenKind : "",
+    headerName: text(rawAuth.headerName, 60)
+  };
   report.jsFiles = stringList(report.jsFiles).map(authorizedAssetUrl).filter(Boolean);
   report.withheldRequests = objectList(report.withheldRequests).map(item => ({ url: sameOriginOrText(item.url), reason: text(item.reason, 500) }));
   report.externalScriptHosts = stringList(report.externalScriptHosts).filter(value => {
@@ -3861,7 +4001,14 @@ async function restoreTrafficForActiveTab() {
   renderTrafficRecord();
 }
 
-async function startTrafficObserver() {
+function buildObserverPermissionOrigins() {
+  const snapshot = activeTabSnapshot;
+  if (!snapshot?.url || !/^https?:/i.test(snapshot.url)) throw new Error("Open the module in an HTTP/HTTPS tab first.");
+  const current = new URL(snapshot.url);
+  return [`${current.protocol}//${current.hostname}/*`];
+}
+
+async function startTrafficObserver(permissionRequest) {
   const [freshTab] = await browser.tabs.query({ active: true, currentWindow: true });
   if (!freshTab) throw new Error("Could not confirm the active tab. Reopen StackScope on the intended target before starting the observer.");
   assertActiveTargetUnchanged(freshTab);
@@ -3873,7 +4020,7 @@ async function startTrafficObserver() {
   const modulePath = mode === "module" ? normalizeModulePath($("modulePath").value) : null;
   if (!isInScope(current.href, current.origin, mode, modulePath)) throw new Error("The current page is outside the selected module or origin scope.");
   const permissionOrigin = `${current.protocol}//${current.hostname}/*`;
-  const granted = await browser.permissions.request({ origins: [permissionOrigin] });
+  const granted = permissionRequest ? await permissionRequest : await browser.permissions.request({ origins: [permissionOrigin] });
   if (!granted) throw new Error("Site access was not granted, so the click observer was not started.");
 
   const key = trafficStorageKey(tab.id);
@@ -3946,7 +4093,7 @@ function render(tabName) {
   const stats = report.stats || {};
   const observedItems = reportObservedTraffic(report);
   if (tabName === "summary") {
-    panel.innerHTML = `<div class="card"><h3>Scan summary</h3><p><span class="pill">${escapeHtml(report.scope.mode === "module" ? "Module scoped" : "Whole origin")}</span><span class="pill">GET requests only</span></p><div>${escapeHtml(report.origin)}${report.scope.modulePath ? `<br>Module path: <b>${escapeHtml(report.scope.modulePath)}</b>` : ""}</div><ul><li>${stats.urlsVisited || 0} URLs requested</li><li>${stats.pageRoutesDiscovered ?? stats.htmlPagesParsed ?? 0} page routes discovered</li><li>${report.endpoints.length} API endpoint responses recorded</li><li>${stats.anonymousPageChecks || 0} page routes checked without cookies</li><li>${stats.uiModuleCandidates || 0} navigation, tab, or step controls detected</li><li>${stats.inputFieldsDiscovered || 0} form fields inventoried (values not collected)</li><li>${stats.jsFilesDiscovered || 0} JavaScript files fetched</li><li>${stats.formActions || 0} form actions listed without submission</li><li>${stats.nonGetCallSites || 0} non-GET callsites listed without replay</li><li>${stats.graphqlOperations || 0} GraphQL operations or persisted-query hashes found</li><li>${stats.requestIssues || 0} redirect, rate-limit, or network issues recorded</li><li>${stats.http200Endpoints || 0} HTTP 200 API responses</li><li>${stats.queueRemaining || 0} discovered URLs still queued</li></ul><p class="muted">Page routes are listed separately from API responses. An HTML 200 means the page shell responded; it does not prove the app-level route is public. Anonymous comparisons use GET only. ${stats.requestLimitReached ? "URL request cap reached. " : ""}${stats.responseTextLimitReached ? "Response text analysis cap reached. " : ""}${stats.scanDeadlineReached ? "Total scan deadline reached. " : ""}${stats.rateLimitPaused ? "Scan paused because the server rate limit requested a long or unspecified delay. " : ""}</p></div><div class="card"><h3>Scope</h3>Page routes stay within the selected module path. Scripts can be fetched from the active origin and exact additional asset origins you entered. API checks stay on the active origin. ${report.scope.assetOrigins?.length ? `Authorized asset origins: ${report.scope.assetOrigins.map(escapeHtml).join(", ")}.` : "No additional asset origins were authorized."} Cross-origin API hosts are not requested.${report.scope.apiPrefixes?.length ? ` App-specific API prefixes: ${report.scope.apiPrefixes.map(escapeHtml).join(", ")}.` : ""}</div>`;
+    panel.innerHTML = `<div class="card"><h3>Scan summary</h3><p><span class="pill">${escapeHtml(report.scope.mode === "module" ? "Module scoped" : "Whole origin")}</span><span class="pill">GET requests only</span></p><div>${escapeHtml(report.origin)}${report.scope.modulePath ? `<br>Module path: <b>${escapeHtml(report.scope.modulePath)}</b>` : ""}</div><ul><li>${stats.urlsVisited || 0} URLs requested</li><li>${stats.pageRoutesDiscovered ?? stats.htmlPagesParsed ?? 0} page routes discovered</li><li>${report.endpoints.length} API endpoint responses recorded</li><li>${stats.anonymousPageChecks || 0} page routes checked without cookies</li><li>${stats.uiModuleCandidates || 0} navigation, tab, or step controls detected</li><li>${stats.inputFieldsDiscovered || 0} form fields inventoried (values not collected)</li><li>${stats.jsFilesDiscovered || 0} JavaScript files fetched</li><li>${stats.formActions || 0} form actions listed without submission</li><li>${stats.nonGetCallSites || 0} non-GET callsites listed without replay</li><li>${stats.graphqlOperations || 0} GraphQL operations or persisted-query hashes found</li><li>${stats.requestIssues || 0} redirect, rate-limit, or network issues recorded</li><li>${stats.http200Endpoints || 0} HTTP 200 API responses</li><li>${stats.queueRemaining || 0} discovered URLs still queued</li></ul><p class="muted">Authenticated crawl: ${report.auth?.tokenUsed ? `cookies + bearer token from ${escapeHtml(report.auth.tokenSource || "page storage")} (${escapeHtml(report.auth.tokenKind || "token")})` : "browser cookies only (no page-storage token attached)"}. No-cookie comparison, when enabled, sends neither cookies nor token.</p><p class="muted">Page routes are listed separately from API responses. An HTML 200 means the page shell responded; it does not prove the app-level route is public. Anonymous comparisons use GET only. ${stats.requestLimitReached ? "URL request cap reached. " : ""}${stats.responseTextLimitReached ? "Response text analysis cap reached. " : ""}${stats.scanDeadlineReached ? "Total scan deadline reached. " : ""}${stats.rateLimitPaused ? "Scan paused because the server rate limit requested a long or unspecified delay. " : ""}</p></div><div class="card"><h3>Scope</h3>Page routes stay within the selected module path. Scripts can be fetched from the active origin and exact additional asset origins you entered. API checks stay on the active origin. ${report.scope.assetOrigins?.length ? `Authorized asset origins: ${report.scope.assetOrigins.map(escapeHtml).join(", ")}.` : "No additional asset origins were authorized."} Cross-origin API hosts are not requested.${report.scope.apiPrefixes?.length ? ` App-specific API prefixes: ${report.scope.apiPrefixes.map(escapeHtml).join(", ")}.` : ""}</div>`;
   } else if (tabName === "pages") {
     const checks = new Map((report.anonymousPageChecks || []).map(item => [item.url, item]));
     const rows = (report.pages || []).map(page => {
@@ -3993,7 +4140,9 @@ function render(tabName) {
   } else if (tabName === "js") {
     const indicators = report.scriptIndicators || [];
     const unresolved = report.unresolvedImports || [];
-    panel.innerHTML = `<div class="card"><h3>Recursive JavaScript crawl</h3><p>${report.stats.jsFilesDiscovered || 0} JavaScript/source-map files fetched within the request cap.</p><p class="muted">The crawler follows inline scripts, authorized scripts, import maps, configured aliases, dynamic script references, and recursive imports. API/page requests remain on the active origin.</p>${report.jsFiles.map(url => `<div class="endpoint">${escapeHtml(url)}</div>`).join("") || "No authorized JavaScript files were fetched."}${report.externalScriptHosts?.length ? `<p class="muted">Unapproved external script hosts excluded: ${report.externalScriptHosts.map(escapeHtml).join(", ")}</p>` : ""}${unresolved.length ? `<h4>Unresolved import specifiers</h4>${unresolved.map(item => `<div class="idea"><code>${escapeHtml(item.specifier)}</code><div class="endpoint">${escapeHtml(item.source)}</div><small>${escapeHtml(item.reason)}</small></div>`).join("")}` : ""}</div><div class="card"><h3>Sensitive keyword indicators</h3><p class="muted">Only keyword names, source locations, and line numbers are kept. Matched values are never shown or saved; a keyword is not proof of a secret.</p>${indicators.length ? indicators.map(item => `<div class="idea"><b>${escapeHtml(item.keyword)}</b><p class="endpoint">${escapeHtml(item.source)} · line ${item.line}</p></div>`).join("") : "No configured keyword indicators found in analyzed script text."}</div>`;
+    const secrets = report.secretFindings || [];
+    const secretsCard = `<div class="card"><h3>Possible secrets in JavaScript</h3><p class="muted">High-signal credential patterns found in analyzed JavaScript. Values are masked (first/last characters only); open the source at the given line to confirm. A match is a lead, not proof — verify before reporting.</p>${secrets.length ? secrets.map(item => `<div class="idea"><span class="pill warn">${escapeHtml(item.type)}</span><code>${escapeHtml(item.value)}</code><p class="endpoint">${escapeHtml(item.source)} · line ${item.line}</p></div>`).join("") : "No high-signal secret patterns were found in analyzed script text."}</div>`;
+    panel.innerHTML = `<div class="card"><h3>Recursive JavaScript crawl</h3><p>${report.stats.jsFilesDiscovered || 0} JavaScript/source-map files fetched within the request cap.</p><p class="muted">The crawler follows inline scripts, authorized scripts, import maps, configured aliases, dynamic script references, and recursive imports. API/page requests remain on the active origin.</p>${report.jsFiles.map(url => `<div class="endpoint">${escapeHtml(url)}</div>`).join("") || "No authorized JavaScript files were fetched."}${report.externalScriptHosts?.length ? `<p class="muted">Unapproved external script hosts excluded: ${report.externalScriptHosts.map(escapeHtml).join(", ")}</p>` : ""}${unresolved.length ? `<h4>Unresolved import specifiers</h4>${unresolved.map(item => `<div class="idea"><code>${escapeHtml(item.specifier)}</code><div class="endpoint">${escapeHtml(item.source)}</div><small>${escapeHtml(item.reason)}</small></div>`).join("")}` : ""}</div>${secretsCard}<div class="card"><h3>Sensitive keyword indicators</h3><p class="muted">Only keyword names, source locations, and line numbers are kept. Matched values are never shown or saved; a keyword is not proof of a secret.</p>${indicators.length ? indicators.map(item => `<div class="idea"><b>${escapeHtml(item.keyword)}</b><p class="endpoint">${escapeHtml(item.source)} · line ${item.line}</p></div>`).join("") : "No configured keyword indicators found in analyzed script text."}</div>`;
   } else if (tabName === "anonymous") {
     const checks = report.anonymousChecks || [];
     const pageChecks = report.anonymousPageChecks || [];
@@ -4116,7 +4265,16 @@ async function discardPendingReport() {
 }
 
 $("start").addEventListener("click", () => {
-  scan().catch(error => {
+  // Firefox requires permissions.request to be called synchronously from the
+  // user gesture, before any await. Start it here and hand the promise to scan.
+  let permissionRequest;
+  try {
+    permissionRequest = browser.permissions.request({ origins: buildScanPermissionOrigins() });
+  } catch (error) {
+    $("status").textContent = `Error: ${error?.message || "Scan could not start."}`;
+    return;
+  }
+  scan(permissionRequest).catch(error => {
     $("status").textContent = `Error: ${error?.message || "Scan could not start."}`;
     updateStartButton();
     $("stop").disabled = true;
@@ -4135,7 +4293,14 @@ $("checkAnonymous").addEventListener("change", () => {
   $("anonymousLimit").disabled = !$("checkAnonymous").checked;
 });
 $("startObserver").addEventListener("click", () => {
-  startTrafficObserver().catch(error => { $("status").textContent = `Observer error: ${error?.message || "Could not start the observer."}`; });
+  let permissionRequest;
+  try {
+    permissionRequest = browser.permissions.request({ origins: buildObserverPermissionOrigins() });
+  } catch (error) {
+    $("status").textContent = `Observer error: ${error?.message || "Could not start the observer."}`;
+    return;
+  }
+  startTrafficObserver(permissionRequest).catch(error => { $("status").textContent = `Observer error: ${error?.message || "Could not start the observer."}`; });
 });
 $("stopObserver").addEventListener("click", () => {
   stopTrafficObserver().catch(error => { $("status").textContent = `Could not stop observer: ${error?.message || "unknown error"}`; });
