@@ -1022,6 +1022,57 @@ function anonymousAccessVerdict(item) {
   return { level: "review", label: "Responds without auth, metadata differs — review" };
 }
 
+function parseAllowHeaders(allow, acam) {
+  return [...new Set(`${allow || ""},${acam || ""}`.split(",").map(method => method.trim().toUpperCase()).filter(method => /^[A-Z]{3,10}$/.test(method)))];
+}
+
+// Classify an actively probed HTTP method result. "session" is authenticated,
+// "anon" is without cookies/token. A state-changing verb accepted without auth
+// is a strong broken-access-control lead; bodies are never sent or inspected.
+function methodAccessVerdict(method, sessionStatus, anonStatus) {
+  const stateChanging = !["GET", "HEAD", "OPTIONS"].includes(method);
+  const anon = Number(anonStatus);
+  if (!Number.isFinite(anon) || anon === 0) return { level: "inconclusive", label: "No readable response" };
+  if ([401, 403].includes(anon)) return { level: "protected", label: `Requires auth (${anon}) without credentials` };
+  if (anon === 405) return { level: "info", label: "Method not allowed (405)" };
+  if (anon === 404) return { level: "info", label: "Not found (404)" };
+  if (anon >= 200 && anon < 400 && stateChanging) return { level: "public", label: `⚠ ${method} accepted without authentication (HTTP ${anon})` };
+  if (anon >= 200 && anon < 400) return { level: "info", label: `Reachable without auth (HTTP ${anon})` };
+  return { level: "review", label: `HTTP ${anon} without auth — review` };
+}
+
+function corsVerdict(testedOrigin, acao, acac) {
+  const allowOrigin = String(acao || "").trim();
+  const allowCreds = String(acac || "").trim().toLowerCase() === "true";
+  if (!allowOrigin) return null;
+  if (allowOrigin === testedOrigin && allowCreds) return { level: "critical", label: `Reflects foreign Origin ${testedOrigin} with Access-Control-Allow-Credentials: true — cross-origin data theft likely` };
+  if (allowOrigin === testedOrigin) return { level: "high", label: `Reflects arbitrary foreign Origin ${testedOrigin} (no credentials) — review what data is exposed` };
+  if (allowOrigin === "*" && allowCreds) return { level: "high", label: "Wildcard Access-Control-Allow-Origin with credentials (browsers reject, but verify server intent)" };
+  if (allowOrigin === "*") return { level: "medium", label: "Wildcard Access-Control-Allow-Origin — any site can read non-credentialed responses" };
+  return { level: "info", label: `Access-Control-Allow-Origin: ${allowOrigin}${allowCreds ? " with credentials" : ""}` };
+}
+
+function buildSecurityAudit(headers, origin) {
+  const get = name => headers?.[name.toLowerCase()];
+  const isHttps = String(origin || "").startsWith("https:");
+  const findings = [];
+  const add = (severity, header, note) => findings.push({ severity, header, note });
+  if (!get("content-security-policy")) add("medium", "Content-Security-Policy", "No CSP on the primary response; review XSS and framing defenses.");
+  if (isHttps && !get("strict-transport-security")) add("medium", "Strict-Transport-Security", "No HSTS on an HTTPS origin; connections can be downgraded.");
+  if (!get("x-frame-options") && !/frame-ancestors/i.test(String(get("content-security-policy") || ""))) add("low", "X-Frame-Options", "No framing protection (X-Frame-Options or CSP frame-ancestors); review clickjacking exposure.");
+  if (!/nosniff/i.test(String(get("x-content-type-options") || ""))) add("low", "X-Content-Type-Options", "Missing nosniff; browsers may MIME-sniff responses.");
+  if (!get("referrer-policy")) add("low", "Referrer-Policy", "No Referrer-Policy; full URLs may leak to third parties.");
+  const acao = get("access-control-allow-origin");
+  const acac = String(get("access-control-allow-credentials") || "").toLowerCase() === "true";
+  if (acao === "*" && acac) add("high", "Access-Control-Allow-Origin", "Wildcard ACAO sent with credentials:true (invalid but a strong misconfiguration signal).");
+  else if (acao === "*") add("medium", "Access-Control-Allow-Origin", "Wildcard ACAO exposes non-credentialed responses to any origin.");
+  const server = get("server");
+  const powered = get("x-powered-by");
+  if (server && /\d/.test(server)) add("info", "Server", `Version disclosure: ${server}`);
+  if (powered) add("info", "X-Powered-By", `Technology disclosure: ${powered}`);
+  return findings;
+}
+
 function looksLikeHtmlDocument(bodyText) {
   const prefix = String(bodyText || "").slice(0, 4096).replace(/^\uFEFF/, "").replace(/^(?:\s|<!--[\s\S]*?-->)+/, "");
   return /^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b|<main\b|<div\b|<form\b)/i.test(prefix);
@@ -2664,6 +2715,19 @@ async function scan(permissionRequest) {
     const only200 = $("only200").checked;
     const checkAnonymous = $("checkAnonymous").checked;
     const anonymousLimit = Math.max(1, Math.min(2000, Number($("anonymousLimit").value) || 250));
+    const probeMethods = $("probeMethods")?.checked || false;
+    const probeStateChanging = probeMethods && ($("probeStateChanging")?.checked || false);
+    const corsTest = $("corsTest")?.checked || false;
+    let corsOrigin = "https://www.bing.com";
+    if (corsTest) {
+      const raw = String($("corsOrigin")?.value || "").trim() || "https://www.bing.com";
+      let parsed;
+      try { parsed = new URL(raw); } catch (_) { throw new Error("Enter a valid CORS test Origin such as https://www.bing.com."); }
+      if (!/^https?:$/.test(parsed.protocol) || parsed.origin !== raw.replace(/\/$/, "") || parsed.username || parsed.password) throw new Error("Use an exact origin for the CORS test, such as https://www.bing.com.");
+      corsOrigin = parsed.origin;
+    }
+    // Baselines feed both the no-cookie comparison and the method/CORS probe.
+    const collectBaselines = checkAnonymous || probeMethods || corsTest;
     const seeds = [];
     if (scope(current.href)) seeds.push({ url: current.href, depth: 0, kind: "page" });
     if (mode === "module") {
@@ -3058,7 +3122,7 @@ async function scan(permissionRequest) {
         const byteSource = declaredBytes !== null ? "Content-Length" : bodyMetrics.complete ? "measured body" : "measured lower bound (128 KiB cap)";
         const usefulEndpoint = !isHtml && isUsefulEndpoint(finalUrl, contentType, item.kind);
         let authBaseline = null;
-        if (checkAnonymous && !isScript && item.kind !== "js" && usefulEndpoint) {
+        if (collectBaselines && !isScript && item.kind !== "js" && usefulEndpoint) {
           authBaseline = {
             url: finalUrl, status: response.status, type: contentType || "unknown", headers, kind: "api",
             bytes: effectiveBytes, byteSource, sizeComplete
@@ -3081,7 +3145,7 @@ async function scan(permissionRequest) {
           const pageType = contentType || "text/html (body detected)";
           const pageRecord = { url: reportUrl(finalUrl), status: response.status, type: pageType, depth: item.depth, bytes: effectiveBytes, byteSource, sizeComplete, parameters: getQueryParameterNames(finalUrl), headers };
           pages.push(pageRecord);
-          if (checkAnonymous) pageBaselines.push({ url: finalUrl, status: response.status, type: pageType, depth: item.depth, bytes: effectiveBytes, byteSource, sizeComplete, headers, kind: "page" });
+          if (collectBaselines) pageBaselines.push({ url: finalUrl, status: response.status, type: pageType, depth: item.depth, bytes: effectiveBytes, byteSource, sizeComplete, headers, kind: "page" });
         }
         if (isHtml && body) {
           const parser = new DOMParser();
@@ -3347,6 +3411,77 @@ async function scan(permissionRequest) {
       }
     }
 
+    // ---- HTTP-method and CORS access-control probe (opt-in) ----
+    const methodProbes = [];
+    const corsFindings = [];
+    let methodProbesAttempted = 0;
+    let corsProbesAttempted = 0;
+    if ((probeMethods || corsTest) && !stopRequested) {
+      const probeSeen = new Set();
+      const probeTargets = [];
+      for (const baseline of [...authBaselines, ...pageBaselines]) {
+        if (!baseline || probeSeen.has(baseline.url) || !sameOrigin(baseline.url)) continue;
+        if (blockedRequestReason(baseline.url) || hasCredentialQuery(baseline.url)) continue;
+        probeSeen.add(baseline.url);
+        probeTargets.push(baseline);
+      }
+      const boundedProbeTargets = probeTargets.slice(0, anonymousLimit);
+      let corsReady = false;
+      if (corsTest) {
+        try { const res = await browser.runtime.sendMessage({ type: "stackscope:cors-config", active: true, origin: corsOrigin }); corsReady = Boolean(res?.ok); }
+        catch (_) { corsReady = false; }
+      }
+      const readAllow = response => parseAllowHeaders(response.headers.get("allow"), response.headers.get("access-control-allow-methods"));
+      const safeProbeFetch = async (url, method, credentials, headers) => {
+        const controller = new AbortController();
+        activeController = controller;
+        const timeout = setTimeout(() => controller.abort(), 15_000);
+        try { return await fetch(url, { method, credentials, headers: headers || {}, redirect: "manual", cache: "no-store", signal: controller.signal }); }
+        finally { clearTimeout(timeout); if (activeController === controller) activeController = null; }
+      };
+      try {
+      for (const baseline of boundedProbeTargets) {
+        if (stopRequested || Date.now() >= scanDeadline) { if (Date.now() >= scanDeadline) scanDeadlineReached = true; break; }
+        const url = baseline.url;
+        if (probeMethods) {
+          methodProbesAttempted += 1;
+          $("status").textContent = `Probing methods ${methodProbesAttempted}/${boundedProbeTargets.length} · ${reportUrl(url)}`;
+          let allowAuthed = [];
+          let allowAnon = [];
+          try { const r = await safeProbeFetch(url, "OPTIONS", "include", crawlHeaders); allowAuthed = readAllow(r); try { await r.body?.cancel(); } catch (_) { /* no body */ } } catch (_) { /* OPTIONS unavailable */ }
+          try { const r = await safeProbeFetch(url, "OPTIONS", "omit"); allowAnon = readAllow(r); try { await r.body?.cancel(); } catch (_) { /* no body */ } } catch (_) { /* OPTIONS unavailable */ }
+          const methodsToSend = ["HEAD", ...(probeStateChanging ? ["POST", "PUT", "PATCH"] : [])];
+          const methodResults = [];
+          for (const method of methodsToSend) {
+            if (stopRequested || Date.now() >= scanDeadline) break;
+            let authedStatus = null;
+            let anonStatus = null;
+            try { const r = await safeProbeFetch(url, method, "include", crawlHeaders); authedStatus = r.status; try { await r.body?.cancel(); } catch (_) { /* no body */ } } catch (_) { /* request failed */ }
+            await new Promise(resolve => setTimeout(resolve, 120));
+            try { const r = await safeProbeFetch(url, method, "omit"); anonStatus = r.status; try { await r.body?.cancel(); } catch (_) { /* no body */ } } catch (_) { /* request failed */ }
+            const verdict = methodAccessVerdict(method, authedStatus, anonStatus);
+            methodResults.push({ method, authedStatus, anonStatus, verdictLevel: verdict.level, verdictLabel: verdict.label });
+            await new Promise(resolve => setTimeout(resolve, 120));
+          }
+          methodProbes.push({ url: reportUrl(url), kind: baseline.kind || "endpoint", allowAuthed, allowAnon, methodResults });
+        }
+        if (corsTest && corsReady) {
+          corsProbesAttempted += 1;
+          $("status").textContent = `CORS probe ${corsProbesAttempted}/${boundedProbeTargets.length} · ${reportUrl(url)}`;
+          try { const r = await safeProbeFetch(url, "GET", "omit", { "x-stackscope-cors": "1" }); try { await r.body?.cancel(); } catch (_) { /* no body */ } } catch (_) { /* request failed */ }
+          let captured = null;
+          try { captured = await browser.runtime.sendMessage({ type: "stackscope:cors-result", url }); } catch (_) { /* background unavailable */ }
+          const verdict = captured ? corsVerdict(corsOrigin, captured.acao, captured.acac) : null;
+          if (verdict) corsFindings.push({ url: reportUrl(url), testedOrigin: corsOrigin, acao: String(captured.acao || ""), acac: String(captured.acac || ""), level: verdict.level, label: verdict.label });
+          await new Promise(resolve => setTimeout(resolve, 120));
+        }
+      }
+      } finally {
+        if (corsTest) { try { await browser.runtime.sendMessage({ type: "stackscope:cors-config", active: false }); } catch (_) { /* background already idle */ } }
+      }
+    }
+    const securityAudit = buildSecurityAudit(headersBag, origin);
+
     const uniqueEndpoints = [...new Map(endpoints.map(entry => [reportUrl(entry.url), { ...entry, url: reportUrl(entry.url) }])).values()]
       .sort((a, b) => a.url.localeCompare(b.url));
     const uniquePages = [...new Map(pages.map(entry => [entry.url, entry])).values()].sort((a, b) => a.url.localeCompare(b.url));
@@ -3396,7 +3531,7 @@ async function scan(permissionRequest) {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       createdAt: new Date().toISOString(),
       origin,
-      scope: { mode, modulePath, assetOrigins, importAliases, apiPrefixes, strictSameOrigin: true, only200, crawlJs, maxPages, checkAnonymous, anonymousLimit },
+      scope: { mode, modulePath, assetOrigins, importAliases, apiPrefixes, strictSameOrigin: true, only200, crawlJs, maxPages, checkAnonymous, anonymousLimit, probeMethods, probeStateChanging, corsTest, corsOrigin: corsTest ? corsOrigin : null },
       stats: {
         requestsAttempted: requestCount,
         urlsVisited: visited.size,
@@ -3455,6 +3590,9 @@ async function scan(permissionRequest) {
       jsFiles: [...new Set([...scriptUrls].map(reportUrl))].sort(),
       scriptIndicators,
       secretFindings,
+      methodProbes,
+      corsFindings,
+      securityAudit,
       auth: { tokenUsed: Boolean(capturedToken), tokenSource: capturedToken?.source || null, tokenKind: capturedToken?.kind || null, headerName: capturedToken?.headerName || null },
       endpoints: uniqueEndpoints,
       anonymousChecks,
@@ -3467,6 +3605,8 @@ async function scan(permissionRequest) {
         "Authenticated-versus-anonymous comparison is GET-only. It measures metadata and at most 128 KiB of streamed bytes when Content-Length is absent; it never retains response bodies.",
         "The passive observer records page-initiated methods and routes and extracts parameter names only from supported request body formats. It never stores parameter values or response bodies, reads cookies or authorization headers, or replays requests.",
         "Only discovered same-origin URLs are requested; redirects and cross-origin resources are excluded.",
+        "HTTP-method probing uses safe OPTIONS/HEAD by default. If the state-changing opt-in is enabled, empty-body POST/PUT/PATCH requests are sent to read response status (DELETE is never sent automatically and state-changing route names are skipped); only enable it in an authorized, reversible test environment.",
+        "The CORS test sets the Origin request header via the webRequest API to the configured foreign origin and reads only the Access-Control-Allow-Origin/Credentials response headers; it does not read or store response bodies.",
         "The passive request observer cannot see service-worker-owned fetches or API calls completed before observer installation; cross-origin traffic is excluded.",
         "JavaScript extraction is heuristic and may miss obfuscated or dynamically assembled paths.",
         "GET requests can still have application-specific side effects; inspect the target and authorization before scanning."
@@ -3617,7 +3757,7 @@ function sanitizeStoredReport(rawReport) {
     "id", "createdAt", "origin", "scope", "stats", "fingerprints", "headers", "pages", "routeCandidates",
     "transportEndpoints", "formActions", "nonGetCallSites", "graphqlOperations", "technologyVersions", "requestIssues",
     "unresolvedImports", "uiModules", "inputFields", "parameterReviews", "routeTestIdeas", "reconChecklist", "observedTraffic",
-    "externalScriptHosts", "jsFiles", "scriptIndicators", "secretFindings", "auth", "endpoints", "anonymousChecks", "anonymousPageChecks",
+    "externalScriptHosts", "jsFiles", "scriptIndicators", "secretFindings", "auth", "methodProbes", "corsFindings", "securityAudit", "endpoints", "anonymousChecks", "anonymousPageChecks",
     "withheldRequests", "testIdeas", "limitations"
   ];
   report = Object.fromEntries(allowedFields.filter(key => Object.prototype.hasOwnProperty.call(report, key)).map(key => [key, report[key]]));
@@ -3649,6 +3789,10 @@ function sanitizeStoredReport(rawReport) {
   report.scope.crawlJs = rawScope.crawlJs !== false;
   report.scope.maxPages = count(rawScope.maxPages);
   report.scope.anonymousLimit = count(rawScope.anonymousLimit);
+  report.scope.probeMethods = Boolean(rawScope.probeMethods);
+  report.scope.probeStateChanging = Boolean(rawScope.probeStateChanging);
+  report.scope.corsTest = Boolean(rawScope.corsTest);
+  report.scope.corsOrigin = (() => { try { const parsed = new URL(String(rawScope.corsOrigin || "")); return /^https?:$/.test(parsed.protocol) && parsed.origin === rawScope.corsOrigin ? parsed.origin : null; } catch (_) { return null; } })();
   if (typeof rawScope.mode === "string" && !["site", "module"].includes(rawScope.mode)) return null;
   if (report.scope.mode === "module") {
     try { report.scope.modulePath = normalizeModulePath(rawScope.modulePath); }
@@ -3875,6 +4019,33 @@ function sanitizeStoredReport(rawReport) {
     tokenKind: ["jwt", "opaque"].includes(rawAuth.tokenKind) ? rawAuth.tokenKind : "",
     headerName: text(rawAuth.headerName, 60)
   };
+  const methodName = value => { const raw = text(value, 10).toUpperCase(); return /^[A-Z]{3,10}$/.test(raw) ? raw : ""; };
+  report.methodProbes = objectList(report.methodProbes).map(item => ({
+    url: sameOriginOrText(item.url),
+    kind: ["page", "endpoint", "js"].includes(item.kind) ? item.kind : "endpoint",
+    allowAuthed: (Array.isArray(item.allowAuthed) ? item.allowAuthed : []).map(methodName).filter(Boolean).slice(0, 15),
+    allowAnon: (Array.isArray(item.allowAnon) ? item.allowAnon : []).map(methodName).filter(Boolean).slice(0, 15),
+    methodResults: objectList(item.methodResults).map(result => ({
+      method: methodName(result.method),
+      authedStatus: status(result.authedStatus),
+      anonStatus: status(result.anonStatus),
+      verdictLevel: ["public", "protected", "info", "review", "inconclusive"].includes(result.verdictLevel) ? result.verdictLevel : "inconclusive",
+      verdictLabel: text(result.verdictLabel, 160)
+    })).filter(result => result.method).slice(0, 10)
+  })).filter(item => item.url).slice(0, 2000);
+  report.corsFindings = objectList(report.corsFindings).map(item => ({
+    url: sameOriginOrText(item.url),
+    testedOrigin: text(item.testedOrigin, 200),
+    acao: text(item.acao, 200),
+    acac: text(item.acac, 20),
+    level: ["critical", "high", "medium", "info"].includes(item.level) ? item.level : "info",
+    label: text(item.label, 300)
+  })).filter(item => item.url).slice(0, 2000);
+  report.securityAudit = objectList(report.securityAudit).map(item => ({
+    severity: ["high", "medium", "low", "info"].includes(item.severity) ? item.severity : "info",
+    header: text(item.header, 80),
+    note: text(item.note, 300)
+  })).slice(0, 50);
   report.jsFiles = stringList(report.jsFiles).map(authorizedAssetUrl).filter(Boolean);
   report.withheldRequests = objectList(report.withheldRequests).map(item => ({ url: sameOriginOrText(item.url), reason: text(item.reason, 500) }));
   report.externalScriptHosts = stringList(report.externalScriptHosts).filter(value => {
@@ -4188,6 +4359,21 @@ function render(tabName) {
     panel.innerHTML = !report.scope.checkAnonymous || (report.stats.stopped && checks.length === 0 && pageChecks.length === 0)
       ? emptyMessage
        : `<div class="card"><h3>Without-cookie checks</h3><p class="muted">GET requests use credentials omitted. Only a login redirect, an authentication status after a successful browser-session response, or a non-HTML 200 response with different metadata is shown. Identical responses, HTML shells, unavailable checks, and comparisons without a successful browser-session baseline are hidden as inconclusive. Raw header values and response bodies are not shown.</p><p>${stats.anonymousRequestsAttempted || 0} requests sent · ${pageChecks.length} page routes checked · ${checks.length} API responses checked · ${usefulPageChecks.length} page-route leads shown · ${usefulApiChecks.length} API leads shown · ${Math.max(0, pageChecks.length - usefulPageChecks.length)} page results hidden · ${Math.max(0, checks.length - usefulApiChecks.length)} API results hidden${report.stats.stopped ? " · stopped early" : ""}</p></div>${authNote}<div class="card"><h3>Page route results</h3>${pageRows || "No actionable page-route result. HTML shells and ambiguous or unavailable checks were hidden."}</div><div class="card"><h3>API endpoint checks</h3>${apiRows || "No actionable API access-control difference. Ambiguous or unavailable checks were hidden."}</div>`;
+  } else if (tabName === "access") {
+    const methodProbes = report.methodProbes || [];
+    const corsFindings = report.corsFindings || [];
+    const securityAudit = report.securityAudit || [];
+    const levelClass = level => level === "critical" || level === "high" || level === "public" ? "warn" : level === "protected" ? "good" : "";
+    const methodCard = report.scope?.probeMethods
+      ? `<div class="card"><h3>HTTP method access control</h3><p class="muted">Advertised methods come from safe OPTIONS requests; HEAD${report.scope?.probeStateChanging ? ", POST, PUT, and PATCH were actively sent with empty bodies" : " was actively sent"}. "Authed" uses cookies${report.auth?.tokenUsed ? " + bearer token" : ""}; "No-auth" sends neither. A state-changing verb accepted without auth is a strong lead. DELETE is never sent automatically.</p>${methodProbes.length ? methodProbes.map(item => `<div class="card"><div class="endpoint">${escapeHtml(item.url)}</div><p class="muted">Allow (authed): ${item.allowAuthed.length ? escapeHtml(item.allowAuthed.join(", ")) : "—"} · Allow (no-auth): ${item.allowAnon.length ? escapeHtml(item.allowAnon.join(", ")) : "—"}</p>${item.methodResults.map(result => `<div class="idea"><span class="pill ${levelClass(result.verdictLevel)}">${escapeHtml(result.method)}</span><span class="muted">authed ${result.authedStatus ?? "—"} · no-auth ${result.anonStatus ?? "—"}</span><p>${escapeHtml(result.verdictLabel)}</p></div>`).join("")}</div>`).join("") : "No routes were probed, or all candidates were skipped as sensitive/state-changing."}</div>`
+      : `<div class="card"><h3>HTTP method access control</h3><p>Method probing was not enabled for this scan. Enable "Probe HTTP methods per route" before scanning.</p></div>`;
+    const corsCard = report.scope?.corsTest
+      ? `<div class="card"><h3>CORS test (Origin: ${escapeHtml(report.scope?.corsOrigin || "")})</h3><p class="muted">Each route was requested with a foreign Origin header; the server's Access-Control-Allow-Origin/Credentials response is shown. A reflected foreign Origin or a wildcard with credentials is a misconfiguration.</p>${corsFindings.length ? corsFindings.map(item => `<div class="idea"><span class="pill ${item.level === "critical" || item.level === "high" ? "warn" : ""}">${escapeHtml(item.level.toUpperCase())}</span><div class="endpoint">${escapeHtml(item.url)}</div><p>${escapeHtml(item.label)}</p><small>ACAO: ${escapeHtml(item.acao || "—")} · ACAC: ${escapeHtml(item.acac || "—")}</small></div>`).join("") : "No CORS-relevant Access-Control-Allow-Origin headers were observed on probed routes."}</div>`
+      : "";
+    const auditCard = securityAudit.length
+      ? `<div class="card"><h3>Security header audit (primary response)</h3><p class="muted">Observed from the first in-scope response. Missing headers are review leads, not confirmed vulnerabilities.</p>${securityAudit.map(item => `<div class="idea"><span class="pill ${item.severity === "high" ? "warn" : ""}">${escapeHtml(item.severity.toUpperCase())}</span><b>${escapeHtml(item.header)}</b><p>${escapeHtml(item.note)}</p></div>`).join("")}</div>`
+      : `<div class="card"><h3>Security header audit (primary response)</h3><p>No notable missing or risky security headers were detected on the primary response.</p></div>`;
+    panel.innerHTML = methodCard + corsCard + auditCard;
   } else {
     const baseRouteIdeas = report.routeTestIdeas || [];
     const liveRoutes = observedItems.map(item => ({ url: reportUrl(item.url), method: item.method }));
@@ -4321,6 +4507,14 @@ $("scopeMode").addEventListener("change", () => {
 });
 $("checkAnonymous").addEventListener("change", () => {
   $("anonymousLimit").disabled = !$("checkAnonymous").checked;
+});
+$("probeMethods").addEventListener("change", () => {
+  const on = $("probeMethods").checked;
+  $("probeStateChanging").disabled = !on;
+  if (!on) $("probeStateChanging").checked = false;
+});
+$("corsTest").addEventListener("change", () => {
+  $("corsOrigin").disabled = !$("corsTest").checked;
 });
 $("startObserver").addEventListener("click", () => {
   let permissionRequest;

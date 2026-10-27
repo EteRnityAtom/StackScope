@@ -50,6 +50,17 @@
     <input id="anonymousLimit" type="number" min="1" max="2000" value="250" disabled>
     <p id="anonymousNotice" class="hint">Only enable this for hostnames and paths explicitly allowed by the bug-bounty scope. It sends bounded same-origin GET requests with credentials omitted, records status/metadata only, and does not save response bodies. GET can still have side effects.</p>
 
+    <label class="check opt-in"><input type="checkbox" id="probeMethods"> Probe HTTP methods per route (OPTIONS + HEAD, authenticated vs no-auth)</label>
+    <p class="hint">Enumerates the server's advertised methods with a safe <code>OPTIONS</code> request and compares the <code>Allow</code> header with and without credentials, so a verb that is reachable without auth (for example PUT allowed while GET is blocked) is surfaced. OPTIONS and HEAD do not change state.</p>
+
+    <label class="check opt-in"><input type="checkbox" id="probeStateChanging" disabled> Also actively send POST/PUT/PATCH with empty bodies (may modify data)</label>
+    <p class="hint"><b>Dangerous.</b> Requires method probing above. Sends real POST/PUT/PATCH requests (empty body, no crafted payload) to read the response status authenticated and without auth. DELETE is never sent automatically, and routes whose names look state-changing are skipped. Only enable in a safe test environment you are authorized to modify.</p>
+
+    <label class="check opt-in"><input type="checkbox" id="corsTest"> Test CORS with a foreign Origin</label>
+    <label for="corsOrigin">CORS test Origin</label>
+    <input id="corsOrigin" placeholder="https://www.bing.com" value="https://www.bing.com" autocomplete="off" spellcheck="false" disabled>
+    <p class="hint">Sends each discovered route a request whose <code>Origin</code> header is set to the value above (default <code>https://www.bing.com</code>) and reads the server's <code>Access-Control-Allow-Origin</code>/<code>Access-Control-Allow-Credentials</code> response. A reflected foreign Origin, or a wildcard combined with credentials, is a CORS misconfiguration. This needs the <code>webRequest</code> permission.</p>
+
     <label for="maxPages">Maximum URLs to request (pages, scripts, and routes)</label>
     <input id="maxPages" type="number" min="10" max="5000" value="1000">
     <p class="hint">The cap applies to page, endpoint, and script requests together. Raise it for larger apps; pages stay in the selected module path, while supporting scripts and APIs stay on the active origin.</p>
@@ -81,6 +92,7 @@
       <button data-tab="tech" class="tab">Tech</button>
       <button data-tab="js" class="tab">JS audit</button>
       <button data-tab="anonymous" class="tab">Anon check</button>
+      <button data-tab="access" class="tab">Access / CORS</button>
       <button data-tab="tests" class="tab">Test ideas</button>
     </nav>
     <div id="panel"></div>

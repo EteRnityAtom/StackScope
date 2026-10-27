@@ -18,6 +18,88 @@ function isInModulePath(pathname, modulePath) {
   } catch (_) { return false; }
 }
 
+// ---- CORS probe support ----
+// The popup cannot set a forbidden request header (Origin) through fetch, so it
+// marks each CORS-probe request with a header and this background script rewrites
+// the Origin at the network layer and captures the ACAO/ACAC response headers.
+const corsProbe = { active: false, origin: "", markedRequestIds: new Set(), results: new Map() };
+const CORS_MARKER_HEADER = "x-stackscope-cors";
+
+function isValidHttpOrigin(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return /^https?:$/.test(url.protocol) && url.origin === value && !url.username && !url.password;
+  } catch (_) { return false; }
+}
+
+function onBeforeSendHeadersCors(details) {
+  if (!corsProbe.active) return {};
+  const headers = details.requestHeaders || [];
+  const marked = headers.some(header => header.name.toLowerCase() === CORS_MARKER_HEADER);
+  if (!marked) return {};
+  corsProbe.markedRequestIds.add(details.requestId);
+  const filtered = headers.filter(header => {
+    const name = header.name.toLowerCase();
+    return name !== CORS_MARKER_HEADER && name !== "origin";
+  });
+  filtered.push({ name: "Origin", value: corsProbe.origin });
+  return { requestHeaders: filtered };
+}
+
+function onHeadersReceivedCors(details) {
+  if (!corsProbe.markedRequestIds.has(details.requestId)) return {};
+  corsProbe.markedRequestIds.delete(details.requestId);
+  let acao = null;
+  let acac = null;
+  for (const header of details.responseHeaders || []) {
+    const name = header.name.toLowerCase();
+    if (name === "access-control-allow-origin") acao = header.value || "";
+    else if (name === "access-control-allow-credentials") acac = header.value || "";
+  }
+  corsProbe.results.set(details.url, { acao, acac });
+  return {};
+}
+
+function enableCorsProbe(origin) {
+  corsProbe.active = true;
+  corsProbe.origin = origin;
+  corsProbe.markedRequestIds = new Set();
+  corsProbe.results = new Map();
+  try {
+    if (!browser.webRequest.onBeforeSendHeaders.hasListener(onBeforeSendHeadersCors)) {
+      browser.webRequest.onBeforeSendHeaders.addListener(onBeforeSendHeadersCors, { urls: ["http://*/*", "https://*/*"] }, ["blocking", "requestHeaders"]);
+    }
+    if (!browser.webRequest.onHeadersReceived.hasListener(onHeadersReceivedCors)) {
+      browser.webRequest.onHeadersReceived.addListener(onHeadersReceivedCors, { urls: ["http://*/*", "https://*/*"] }, ["responseHeaders"]);
+    }
+    return true;
+  } catch (_) { return false; }
+}
+
+function disableCorsProbe() {
+  corsProbe.active = false;
+  corsProbe.origin = "";
+  corsProbe.markedRequestIds = new Set();
+  corsProbe.results = new Map();
+  try { browser.webRequest.onBeforeSendHeaders.removeListener(onBeforeSendHeadersCors); } catch (_) { /* listener may be absent */ }
+  try { browser.webRequest.onHeadersReceived.removeListener(onHeadersReceivedCors); } catch (_) { /* listener may be absent */ }
+}
+
+browser.runtime.onMessage.addListener((message, sender) => {
+  if (!message || typeof message !== "object") return undefined;
+  if (message.type === "stackscope:cors-config") {
+    if (message.active && isValidHttpOrigin(message.origin)) return Promise.resolve({ ok: enableCorsProbe(message.origin) });
+    disableCorsProbe();
+    return Promise.resolve({ ok: true });
+  }
+  if (message.type === "stackscope:cors-result") {
+    const result = corsProbe.results.get(message.url) || null;
+    if (result) corsProbe.results.delete(message.url);
+    return Promise.resolve(result);
+  }
+  return undefined;
+});
+
 browser.runtime.onMessage.addListener(async (message, sender) => {
   if (message?.type !== "stackscope:get-early-observer-config") return undefined;
   const tabId = sender.tab?.id;
