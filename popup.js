@@ -1633,6 +1633,18 @@ function detectTechnologies(text, scriptUrls, headers, pageData) {
     if (scriptUrls.some(url => patterns[1].test(url))) score += 1;
     if (score) detected.push({ name, confidence: score >= 3 ? "Likely" : "Possible", score });
   }
+  // <meta name="generator"> and X-Generator advertise the stack directly.
+  const generators = new Set();
+  for (const match of String(text || "").matchAll(/<meta[^>]+name=["']generator["'][^>]*>/gi)) {
+    const content = match[0].match(/content=["']([^"']{1,100})["']/i);
+    if (content) generators.add(content[1].trim());
+  }
+  const headerGenerator = headers && headers["x-generator"];
+  if (headerGenerator) generators.add(String(headerGenerator).slice(0, 100));
+  for (const generator of generators) {
+    if (!generator || detected.some(item => item.name.toLowerCase() === generator.toLowerCase())) continue;
+    detected.push({ name: generator, confidence: "Likely", score: 4 });
+  }
   return detected.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
 }
 
@@ -1848,7 +1860,7 @@ function pageSnapshotCode() {
 function responseHeaders(headers) {
   const allowed = new Set([
     "content-type", "content-length", "cache-control", "vary",
-    "server", "x-powered-by", "x-aspnet-version", "x-application-context",
+    "server", "x-powered-by", "x-aspnet-version", "x-application-context", "x-generator",
     "content-security-policy", "strict-transport-security", "x-frame-options",
     "x-content-type-options", "referrer-policy", "permissions-policy",
     "access-control-allow-origin", "access-control-allow-credentials"
@@ -1862,7 +1874,7 @@ function responseHeaders(headers) {
 }
 
 function headersForComparison(headers) {
-  const volatileOrNonAuthorizationHeaders = new Set(["cache-control", "content-length", "server", "vary", "x-powered-by", "x-aspnet-version", "x-application-context"]);
+  const volatileOrNonAuthorizationHeaders = new Set(["cache-control", "content-length", "server", "vary", "x-powered-by", "x-aspnet-version", "x-application-context", "x-generator"]);
   return Object.entries(headers || {})
     .filter(([name]) => !volatileOrNonAuthorizationHeaders.has(name.toLowerCase()))
     .map(([name, value]) => [name.toLowerCase(), name.toLowerCase() === "content-type" ? normalizedMediaType(value) : value])
@@ -2889,8 +2901,11 @@ async function scan(permissionRequest) {
       try { if (externalScriptHosts.size < 50) externalScriptHosts.add(new URL(url).host); } catch (_) { /* skip malformed asset references */ }
     };
 
-    // Read the current page only when it is inside the selected boundary.
-    if (scope(current.href)) {
+    // Snapshot the active tab's rendered DOM. The user opened this tab and
+    // granted host access, so reading it for fingerprinting is in scope even in
+    // module mode; it is the same origin being assessed. Crawling of other
+    // pages still respects the module boundary.
+    if (sameOrigin(current.href)) {
       try {
         const injected = await browser.scripting.executeScript({ target: { tabId: tab.id }, func: pageSnapshotCode() });
         if (injected?.[0]?.result) live = { ...live, ...injected[0].result };
@@ -3099,7 +3114,7 @@ async function scan(permissionRequest) {
         const headers = responseHeaders(response.headers);
         const rawLength = response.headers.get("content-length");
         const declaredBytes = /^\d+$/.test(rawLength || "") ? Number(rawLength) : null;
-        if (item.depth === 0) Object.assign(headersBag, headers);
+        if (isHtml && item.kind === "page" && (item.url === current.href || Object.keys(headersBag).length === 0)) Object.assign(headersBag, headers);
         const readable = contentType.includes("text/html") || contentType.includes("javascript") || contentType.includes("ecmascript") || contentType.includes("json") || contentType.startsWith("text/") || isScript;
         const sniffUnknownType = !contentType && !isScript;
         let body = "";
@@ -3697,7 +3712,7 @@ function compactStoredHeaders(headers) {
   if (!headers || typeof headers !== "object" || Array.isArray(headers)) return {};
   const allowed = new Set([
     "content-type", "content-length", "cache-control", "vary", "server", "x-powered-by", "x-aspnet-version",
-    "x-application-context", "content-security-policy", "strict-transport-security", "x-frame-options",
+    "x-application-context", "x-generator", "content-security-policy", "strict-transport-security", "x-frame-options",
     "x-content-type-options", "referrer-policy", "permissions-policy", "access-control-allow-origin",
     "access-control-allow-credentials"
   ]);
