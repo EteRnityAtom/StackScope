@@ -2797,6 +2797,23 @@ async function scan(permissionRequest) {
     const scriptIndicatorKeys = new Set();
     const secretFindings = [];
     const secretFindingKeys = new Set();
+    // Content-hash dedup: skip the secret/indicator scan on a body already
+    // scanned under another URL (SPA fallback routing serves identical HTML for
+    // many routes). URL/endpoint discovery is never skipped. Mirrors the Go
+    // crawler's contentHashesSeen.
+    const contentHashesSeen = new Set();
+    const hashBody = str => { let h = 0x811c9dc5; for (let i = 0; i < str.length; i += 1) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); } return h >>> 0; };
+    const isDuplicateBody = body => {
+      if (!body) return false;
+      const h = hashBody(body);
+      if (contentHashesSeen.has(h)) return true;
+      contentHashesSeen.add(h);
+      return false;
+    };
+    const scanText = (text, sourceUrl) => {
+      collectSensitiveIndicators(text, sourceUrl, scriptIndicators, scriptIndicatorKeys);
+      extractSecretFindings(text, sourceUrl, secretFindings, secretFindingKeys);
+    };
     const addScriptUrl = url => {
       if (scriptUrls.size < maxPages) scriptUrls.add(url);
     };
@@ -2946,10 +2963,9 @@ async function scan(permissionRequest) {
     };
     const initialNextManifest = nextBuildManifestUrl(live.html, current.href);
     if (crawlJs && initialNextManifest && scriptOrigin(initialNextManifest)) enqueue(initialNextManifest, 1, "js", current.href, false, current.href);
-    const analyzeScriptText = (text, sourceUrl, depth, discoveryBase = current.href) => {
+    const analyzeScriptText = (text, sourceUrl, depth, discoveryBase = current.href, skipSecrets = false) => {
       if (!crawlJs || !text) return;
-      collectSensitiveIndicators(text, sourceUrl, scriptIndicators, scriptIndicatorKeys);
-      extractSecretFindings(text, sourceUrl, secretFindings, secretFindingKeys);
+      if (!skipSecrets) scanText(text, sourceUrl);
       const importPattern = /(?:import\s*(?:[^"'`]*?from\s*)?|import\s*\(|export\s+[^"'`]*?from\s*|require\s*\()\s*["'`]([^"'`]+)["'`]/g;
       let match;
       while ((match = importPattern.exec(text)) !== null) {
@@ -3132,6 +3148,7 @@ async function scan(permissionRequest) {
           bodyMetrics = await measureBodyWithoutRetaining(response);
         }
         if (!isHtml && looksLikeHtmlDocument(body)) isHtml = true;
+        const duplicateBody = isDuplicateBody(body);
         const effectiveBytes = declaredBytes ?? bodyMetrics.bytesRead;
         const sizeComplete = declaredBytes !== null || bodyMetrics.complete;
         const byteSource = declaredBytes !== null ? "Content-Length" : bodyMetrics.complete ? "measured body" : "measured lower bound (128 KiB cap)";
@@ -3165,16 +3182,30 @@ async function scan(permissionRequest) {
         if (isHtml && body) {
           const parser = new DOMParser();
           const dom = parser.parseFromString(body, "text/html");
-          rememberImportMaps(importMapCandidatesFromDocument(dom, finalUrl), finalUrl);
-          rememberUiModules(uiModuleCandidatesFromDocument(dom, finalUrl), finalUrl);
-          rememberInputFields(inputFieldCandidatesFromDocument(dom, finalUrl), finalUrl);
-          rememberFormActions(formActionCandidatesFromDocument(dom, finalUrl), finalUrl);
-          const buildManifest = nextBuildManifestUrl(body, finalUrl);
-          if (crawlJs && buildManifest && scriptOrigin(buildManifest)) enqueue(buildManifest, item.depth + 1, "js", finalUrl, false, finalUrl);
+          // Honor <base href>: relative references in this document resolve
+          // against it, not the document URL. Matches the Go crawler's
+          // discoveredBaseHref handling, but resolved per-document (correct).
+          const baseHrefRaw = dom.querySelector("base[href]")?.getAttribute("href") || "";
+          const docBase = (baseHrefRaw && cleanUrl(baseHrefRaw, finalUrl)) || finalUrl;
+          rememberImportMaps(importMapCandidatesFromDocument(dom, docBase), docBase);
+          rememberUiModules(uiModuleCandidatesFromDocument(dom, docBase), docBase);
+          rememberInputFields(inputFieldCandidatesFromDocument(dom, docBase), docBase);
+          rememberFormActions(formActionCandidatesFromDocument(dom, docBase), docBase);
+          if (!duplicateBody) scanText(body, reportUrl(finalUrl));
+          // HTML comments often hold commented-out endpoints, old routes, and
+          // credentials. The Go crawler scans them; parse them from the body.
+          for (const commentMatch of body.matchAll(/<!--([\s\S]*?)-->/g)) {
+            const comment = commentMatch[1];
+            if (!comment || comment.length < 4) continue;
+            if (!duplicateBody) scanText(comment, `${reportUrl(finalUrl)}#comment`);
+            for (const url of extractUrls(comment, docBase)) enqueueDiscoveredUrl(url, item.depth + 1, docBase);
+          }
+          const buildManifest = nextBuildManifestUrl(body, docBase);
+          if (crawlJs && buildManifest && scriptOrigin(buildManifest)) enqueue(buildManifest, item.depth + 1, "js", docBase, false, docBase);
           for (const element of dom.querySelectorAll("a[href],area[href],form[action],script[src],iframe[src],link[href]")) {
             if (element.tagName === "FORM" && (element.getAttribute("method") || "get").toUpperCase() !== "GET") continue;
             const rawUrl = element.getAttribute("href") || element.getAttribute("action") || element.getAttribute("src");
-            const url = cleanUrl(rawUrl, finalUrl);
+            const url = cleanUrl(rawUrl, docBase);
             const linkRel = (element.getAttribute("rel") || "").toLowerCase();
             const scriptAsset = element.tagName === "SCRIPT" || (element.tagName === "LINK" && (linkRel === "modulepreload" || (linkRel === "preload" && (element.getAttribute("as") || "").toLowerCase() === "script")));
             if (!url || (!scriptAsset && isStaticNonScriptAsset(url)) || (scriptAsset ? !scriptOrigin(url) : !scope(url))) {
@@ -3183,9 +3214,9 @@ async function scan(permissionRequest) {
             }
             if (scriptAsset) {
               addScriptUrl(url);
-              if (crawlJs) enqueue(url, item.depth + 1, "js", finalUrl, false, finalUrl);
+              if (crawlJs) enqueue(url, item.depth + 1, "js", docBase, false, docBase);
             } else if (["A", "AREA", "FORM", "IFRAME"].includes(element.tagName)) {
-              enqueue(url, item.depth + 1, "page", finalUrl, false, finalUrl);
+              enqueue(url, item.depth + 1, "page", docBase, false, docBase);
             }
           }
           let inlineIndex = 0;
@@ -3196,7 +3227,7 @@ async function scan(permissionRequest) {
             inlineBudget -= code.length;
             if (!code) continue;
             inlineIndex += 1;
-            analyzeScriptText(code, `${reportUrl(finalUrl)}#inline-script-${inlineIndex}`, item.depth, finalUrl);
+            analyzeScriptText(code, `${reportUrl(finalUrl)}#inline-script-${inlineIndex}`, item.depth, docBase, duplicateBody);
           }
         } else if (isSourceMap && body) {
           addScriptUrl(finalUrl);
@@ -3204,7 +3235,7 @@ async function scan(permissionRequest) {
             const sourceMap = JSON.parse(body);
             if (Array.isArray(sourceMap.sourcesContent)) {
               sourceMap.sourcesContent.slice(0, 100).forEach((sourceText, index) => {
-                if (typeof sourceText === "string") analyzeScriptText(sourceText, `${reportUrl(finalUrl)}#source-${index + 1}`, item.depth, item.discoveryBase || current.href);
+                if (typeof sourceText === "string") analyzeScriptText(sourceText, `${reportUrl(finalUrl)}#source-${index + 1}`, item.depth, item.discoveryBase || current.href, duplicateBody);
               });
             } else if (Array.isArray(sourceMap.sources)) {
               const sourceBase = sourceMap.sourceRoot ? cleanUrl(sourceMap.sourceRoot, finalUrl) || finalUrl : finalUrl;
@@ -3221,8 +3252,11 @@ async function scan(permissionRequest) {
           }
         } else if (isScript && body) {
           addScriptUrl(finalUrl);
-          analyzeScriptText(body, reportUrl(finalUrl), item.depth, item.discoveryBase || current.href);
+          analyzeScriptText(body, reportUrl(finalUrl), item.depth, item.discoveryBase || current.href, duplicateBody);
         } else if (body && (contentType.includes("json") || contentType.startsWith("text/"))) {
+          // Scan non-HTML text/JSON bodies for secrets too (the Go crawler
+          // scans every body, not only JavaScript).
+          if (!duplicateBody) scanText(body, reportUrl(finalUrl));
           if (crawlJs && (contentType.includes("json") || /manifest/i.test(finalUrl))) {
             for (const manifestScript of extractManifestScriptUrls(body, finalUrl)) {
               if (scriptOrigin(manifestScript)) enqueue(manifestScript, item.depth + 1, "js", finalUrl, false, item.discoveryBase || current.href);
