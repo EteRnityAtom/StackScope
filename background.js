@@ -85,7 +85,7 @@ function disableCorsProbe() {
   try { browser.webRequest.onHeadersReceived.removeListener(onHeadersReceivedCors); } catch (_) { /* listener may be absent */ }
 }
 
-browser.runtime.onMessage.addListener((message, sender) => {
+browser.runtime.onMessage.addListener(message => {
   if (!message || typeof message !== "object") return undefined;
   if (message.type === "stackscope:cors-config") {
     if (message.active && isValidHttpOrigin(message.origin)) return Promise.resolve({ ok: enableCorsProbe(message.origin) });

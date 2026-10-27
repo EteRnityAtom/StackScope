@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-label="StackScope">
+  <rect width="48" height="48" rx="10" fill="#0f1b2d"/>
+  <rect x="3" y="3" width="42" height="42" rx="8" fill="none" stroke="#2dd4bf" stroke-width="2"/>
+  <text x="24" y="31" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#2dd4bf">SS</text>
+</svg>

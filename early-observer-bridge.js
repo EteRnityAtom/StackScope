@@ -6,7 +6,6 @@
     "referrer-policy", "permissions-policy", "access-control-allow-origin",
     "access-control-allow-credentials"
   ]);
-  const sensitiveName = /(?:token|secret|password|passwd|authorization|session|jwt|signature|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key|credential|^auth$|^key$|^code$)/i;
   const sensitivePath = /(?:^|\/)(?:\.env(?:\.[^/]+)?|\.git|actuator|heapdump|credentials|token|access[_-]?token|refresh[_-]?token|auth[_-]?token|session|secret|password|logout|logoff|delete|remove|destroy|checkout|purchase|payment|transfer|reset|execute|run|trigger|webhook|proxy)(?:\/|$)/i;
   const safeHeaders = headers => {
     const result = {};

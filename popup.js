@@ -200,7 +200,6 @@ function entropyScanText(text, minEntropy = 4.3) {
 // actually run -- keeping an ~780-pattern scan fast in the popup thread.
 let nucleiSignatures = [];
 let nucleiTriggerRe = null;
-let secretEngineReady = false;
 const nucleiGenericTokens = new Set(["generic", "private", "basic", "jwt", "high", "token", "secret", "api", "auth", "key"]);
 
 async function initSecretEngine() {
@@ -224,9 +223,8 @@ async function initSecretEngine() {
     }
     const escaped = [...triggers].map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
     nucleiTriggerRe = escaped.length ? new RegExp(`(${escaped.join("|")})`, "gi") : null;
-    secretEngineReady = nucleiSignatures.length > 0;
   } catch (_) {
-    secretEngineReady = false;
+    // High-signal patterns and entropy still run without the nuclei set.
   }
 }
 
@@ -2478,7 +2476,6 @@ function isolatedTrafficBridge(config) {
     previous.active = false;
     try { if (previous.listener) window.removeEventListener("message", previous.listener); } catch (_) { /* remove older bridge listener */ }
   }
-  const comparableHeaders = headers => Object.entries(headers || {}).filter(([name]) => name.toLowerCase() !== "cache-control").sort(([a], [b]) => a.localeCompare(b));
   const isHtmlType = value => /(?:^|\s|;)text\/html(?:\s|;|$)|application\/xhtml\+xml/i.test(String(value || ""));
   const safeTrafficHeaders = new Set([
     "content-type", "content-length", "cache-control", "vary", "server", "x-powered-by",
