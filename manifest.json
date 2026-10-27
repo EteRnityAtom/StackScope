@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "StackScope — Scoped Web Recon",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Scoped web app reconnaissance, user-driven API observation, and framework-specific security test planning for authorized assessments.",
   "permissions": ["activeTab", "scripting", "storage", "webRequest", "webRequestBlocking"],
   "optional_host_permissions": ["http://*/*", "https://*/*"],

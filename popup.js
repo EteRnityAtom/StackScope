@@ -83,6 +83,126 @@ function extractSecretFindings(text, sourceUrl, findings, seen, limit = 500) {
   }
 }
 
+// --- Ported secret engine from EteRnityAtom/deepcrawler (secrets.go) -------
+// Minified/bundled third-party libraries dominate false-positive volume, so
+// they are skipped entirely for secret scanning (matches isLikelyVendorFile).
+const vendorFileRe = /(jquery|bootstrap|swagger-ui|react(-dom)?[.\-]|vendor|polyfill|lodash|underscore|moment\.min|chart(\.min)?\.js|d3\.min|materialize|foundation\.min|angular\.min|vue\.min|popper|font-?awesome|highlight\.min|prism\.min|webpack-runtime|runtime~)[^/]*\.(?:js|css)(?:\?|$)/i;
+function isLikelyVendorFile(rawUrl) { return vendorFileRe.test(String(rawUrl || "")); }
+
+const secretFalsePositiveValues = new Set(["your_api_key", "your-api-key", "xxxxxxxx", "changeme", "placeholder", "example", "test", "null", "undefined", "none"]);
+const implausibleSecretCharsRe = /[<>{}();,`]/;
+const MIN_PLAUSIBLE_SECRET_LENGTH = 6;
+
+function shannonEntropy(value) {
+  if (!value) return 0;
+  const counts = new Map();
+  for (const ch of value) counts.set(ch, (counts.get(ch) || 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) { const p = count / value.length; entropy -= p * Math.log2(p); }
+  return entropy;
+}
+
+function isSequentialAlphabetLike(token) {
+  if (token.length < 8) return false;
+  let ascending = 0;
+  for (let i = 1; i < token.length; i += 1) if (token.charCodeAt(i) === token.charCodeAt(i - 1) + 1) ascending += 1;
+  return ascending / (token.length - 1) > 0.5;
+}
+
+const entropyCandidateRe = /["']([A-Za-z0-9_\-/+=]{20,100})["']/g;
+const identifierLikeRe = /^[a-z]+(?:_[a-z]+)+$/;
+const mimeLikeRe = /^[a-z]+\/[a-z0-9.+\-]+$/i;
+
+function entropyScanText(text, minEntropy = 4.3) {
+  const findings = [];
+  const seen = new Set();
+  entropyCandidateRe.lastIndex = 0;
+  let match;
+  while ((match = entropyCandidateRe.exec(text)) !== null && findings.length < 50) {
+    const token = match[1];
+    if (seen.has(token) || secretFalsePositiveValues.has(token.toLowerCase())) continue;
+    seen.add(token);
+    if (new Set(token).size < 8) continue;
+    if (identifierLikeRe.test(token) || mimeLikeRe.test(token) || isSequentialAlphabetLike(token)) continue;
+    let hasDigit = false, hasUpper = false, hasLower = false, hasSymbol = false;
+    for (const c of token) {
+      if (c >= "0" && c <= "9") hasDigit = true;
+      else if (c >= "A" && c <= "Z") hasUpper = true;
+      else if (c >= "a" && c <= "z") hasLower = true;
+      else if ("+/=_-".includes(c)) hasSymbol = true;
+    }
+    if (!(hasDigit || (hasUpper && hasLower) || (hasSymbol && hasUpper))) continue;
+    const entropy = shannonEntropy(token);
+    if (entropy >= minEntropy) findings.push({ token, entropy: Math.round(entropy * 100) / 100, index: match.index });
+  }
+  return findings;
+}
+
+// Nuclei signature engine, compiled once from the packaged JSON. Each pattern
+// is gated on its vendor keyword (the signature key's first token) via a single
+// alternation pre-scan, so only signatures whose keyword appears in the body
+// actually run -- keeping an ~780-pattern scan fast in the popup thread.
+let nucleiSignatures = [];
+let nucleiTriggerRe = null;
+let secretEngineReady = false;
+const nucleiGenericTokens = new Set(["generic", "private", "basic", "jwt", "high", "token", "secret", "api", "auth", "key"]);
+
+async function initSecretEngine() {
+  try {
+    const response = await fetch(browser.runtime.getURL("nuclei_secret_signatures.json"));
+    const raw = await response.json();
+    const triggers = new Set();
+    for (const [key, entry] of Object.entries(raw)) {
+      const token = String(key).split(/[_-]/)[0].toLowerCase();
+      const trigger = token.length >= 4 && /^[a-z]+$/.test(token) && !nucleiGenericTokens.has(token) ? token : null;
+      if (trigger) triggers.add(trigger);
+      for (const rgx of entry?.regexes || []) {
+        let flags = "";
+        let pattern = String(rgx);
+        if (pattern.startsWith("(?i)")) { flags = "i"; pattern = pattern.slice(4); }
+        if (/\(\?[a-wyz]/.test(pattern)) continue; // skip remaining inline-flag patterns JS can't compile
+        let re;
+        try { re = new RegExp(pattern, flags); } catch (_) { continue; }
+        nucleiSignatures.push({ name: `nuclei_${key}`, re, trigger });
+      }
+    }
+    const escaped = [...triggers].map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    nucleiTriggerRe = escaped.length ? new RegExp(`(${escaped.join("|")})`, "gi") : null;
+    secretEngineReady = nucleiSignatures.length > 0;
+  } catch (_) {
+    secretEngineReady = false;
+  }
+}
+
+function scanNucleiAndEntropy(text, sourceUrl, findings, seen, limit = 2000) {
+  if (!text) return;
+  const lower = text.toLowerCase();
+  const present = new Set();
+  if (nucleiTriggerRe) { nucleiTriggerRe.lastIndex = 0; let m; while ((m = nucleiTriggerRe.exec(lower)) !== null) present.add(m[1].toLowerCase()); }
+  const lineAt = index => { let line = 1; for (let i = 0; i < index && i < text.length; i += 1) if (text.charCodeAt(i) === 10) line += 1; return line; };
+  const record = (type, value, index) => {
+    if (!value || value.length < MIN_PLAUSIBLE_SECRET_LENGTH) return;
+    if (secretFalsePositiveValues.has(value.toLowerCase()) || implausibleSecretCharsRe.test(value)) return;
+    const line = lineAt(index);
+    const key = `${sourceUrl}|${type}|${value.slice(0, 32)}|${line}`;
+    if (seen.has(key) || findings.length >= limit) return;
+    seen.add(key);
+    findings.push({ type, value: maskSecretValue(value), source: sourceUrl, line });
+  };
+  for (const sig of nucleiSignatures) {
+    if (sig.trigger && !present.has(sig.trigger)) continue;
+    sig.re.lastIndex = 0;
+    const matches = text.matchAll(sig.re.global ? sig.re : new RegExp(sig.re.source, sig.re.flags + "g"));
+    let count = 0;
+    for (const m of matches) {
+      if (count >= 25) break;
+      count += 1;
+      record(sig.name, (m[1] && m[1] !== "" ? m[1] : m[0]) || "", m.index || 0);
+    }
+  }
+  for (const hit of entropyScanText(text)) record("high_entropy_string", hit.token, hit.index);
+}
+
 function assertActiveTargetUnchanged(tab) {
   if (!tab?.id) return;
   if (popupOpenedTabId !== null && tab.id !== popupOpenedTabId) {
@@ -1091,7 +1211,10 @@ function extractUrls(text, base) {
   const found = new Set();
   const quoted = /["'`]((?:https?:)?\/\/[^"'`\s<>\\]+|\/[A-Za-z0-9_~!$&'()*+,;=:@%./?-]+)["'`]/g;
   const relativeRoute = /["'`]((?!\.\.?\/)(?:[A-Za-z0-9_~.-]+\/){1,8}[A-Za-z0-9_~!$&'()*+,;=:@%.-]*(?:\?[A-Za-z0-9_~!$&'()*+,;=:@%./?%-]*)?)["'`]/g;
-  for (const re of [quoted, relativeRoute]) {
+  // Bare bundler asset paths (assets/..., static/..., chunks/..., _next/...,
+  // build/..., dist/...) ported from deepcrawler's jsBareBundlerPathRe.
+  const bareBundlerPath = /["'`]((?:assets|static|chunks|_next|build|dist)\/[A-Za-z0-9_\-./]+)["'`]/g;
+  for (const re of [quoted, relativeRoute, bareBundlerPath]) {
     let match;
     while ((match = re.exec(text)) !== null) {
       if (/\$\{|\{\{/.test(match[1])) continue;
@@ -1100,6 +1223,13 @@ function extractUrls(text, base) {
       const url = cleanUrl(match[1], base);
       if (url) found.add(url);
     }
+  }
+  // Unquoted absolute http(s) URLs, ported from deepcrawler's jsAbsoluteURLRe
+  // (catches URLs in comments/concatenations the quoted patterns miss).
+  // ws(s) endpoints are left to the dedicated transport extractor.
+  for (const raw of text.matchAll(/https?:\/\/[a-zA-Z0-9][a-zA-Z0-9\-.]*(?::[0-9]+)?(?:\/[^\s'"<>\\`]*)?/g)) {
+    const url = cleanUrl(raw[0].replace(/[.,;)]+$/, ""), base);
+    if (url) found.add(url);
   }
   return [...found];
 }
@@ -2845,8 +2975,12 @@ async function scan(permissionRequest) {
       return false;
     };
     const scanText = (text, sourceUrl) => {
+      // Vendor/library bundles dominate false positives; skip them entirely for
+      // secret scanning, matching deepcrawler's isLikelyVendorFile behavior.
+      if (isLikelyVendorFile(sourceUrl)) return;
       collectSensitiveIndicators(text, sourceUrl, scriptIndicators, scriptIndicatorKeys);
       extractSecretFindings(text, sourceUrl, secretFindings, secretFindingKeys);
+      scanNucleiAndEntropy(text, sourceUrl, secretFindings, secretFindingKeys);
     };
     const addScriptUrl = url => {
       if (scriptUrls.size < maxPages) scriptUrls.add(url);
@@ -4733,3 +4867,4 @@ restoreStoredReports().catch(error => {
   updateStartButton();
   $("status").textContent = `Could not read local report storage: ${error?.message || "storage error"}`;
 });
+initSecretEngine();
