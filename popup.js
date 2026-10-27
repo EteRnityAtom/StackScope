@@ -334,6 +334,263 @@ const commonIdeas = [
   ["Business logic", "Test workflow and state transitions with dedicated test accounts and reversible actions."]
 ];
 
+const genericConfigLeakPaths = [
+  ["/.env", "Environment secrets (DB creds, API keys, APP_KEY)."],
+  ["/.env.local", "Local environment override; often committed by mistake."],
+  ["/.env.production", "Production secrets."],
+  ["/.env.backup", "Backup of environment secrets."],
+  ["/.git/config", "Exposed Git metadata; full source history can be dumped."],
+  ["/.git/HEAD", "Exposed .git directory indicator."],
+  ["/.svn/entries", "Exposed Subversion metadata."],
+  ["/.DS_Store", "macOS directory listing leak."],
+  ["/backup.zip", "Deployment backup archive."],
+  ["/backup.sql", "Database backup."],
+  ["/dump.sql", "Database dump."],
+  ["/package.json", "Dependency and script inventory."],
+  ["/composer.lock", "PHP dependency versions."],
+  ["/Gemfile.lock", "Ruby dependency versions."],
+  ["/requirements.txt", "Python dependency versions."],
+  ["/Dockerfile", "Build/deploy configuration."],
+  ["/docker-compose.yml", "Service topology and sometimes secrets."]
+];
+
+const genericDangerousEndpoints = [
+  ["/admin/", "Generic admin panel; version disclosure on login."],
+  ["/administrator/", "Admin panel (Joomla and others)."],
+  ["/phpmyadmin/", "Database admin console; version-specific RCEs."],
+  ["/adminer.php", "Single-file DB admin console."],
+  ["/.well-known/security.txt", "Disclosure contact and policy."],
+  ["/graphql", "GraphQL endpoint; test introspection and resolver authorization."],
+  ["/graphiql", "GraphQL IDE; introspection surface."],
+  ["/metrics", "Prometheus metrics; may leak internal URLs/hostnames."],
+  ["/healthz", "Health endpoint; may leak build/version info."],
+  ["/webhook/", "Generic SSRF/state-change surface."],
+  ["/proxy/", "Generic SSRF surface."]
+];
+
+// Framework-specific recon endpoints, template engine (for SSTI leads), and
+// deserialization markers from the TBHM cheat sheet. All are manual-review
+// leads only: StackScope never fetches these, sends payloads, or reads values.
+const frameworkRecon = {
+  "Spring Boot": {
+    recon: [
+      ["/actuator/env", "Environment variables; credential goldmine."],
+      ["/actuator/heapdump", "Full JVM heap dump (passwords, tokens)."],
+      ["/actuator/configprops", "Resolved configuration properties."],
+      ["/actuator/mappings", "All request mappings (route map)."],
+      ["/actuator/jolokia/list", "JMX over HTTP; MBean manipulation can reach RCE."],
+      ["/h2-console", "Exposed H2 console can reach RCE."],
+      ["/swagger-ui.html", "API explorer."],
+      ["/v3/api-docs", "OpenAPI schema."],
+      ["/error?trace=true", "Stack-trace disclosure."]
+    ],
+    engine: { name: "FreeMarker / Thymeleaf / SpEL", test: "${7*7}", confirm: "Returns 49 (Java expression context).", note: "Spring4Shell (CVE-2022-22965) and SpEL injection live here." },
+    deser: "Java ObjectOutputStream — Base64 rO0AB / hex AC ED 00 05 in cookies, session, or ViewState-like values."
+  },
+  "Ruby on Rails": {
+    recon: [
+      ["/rails/info/routes", "Full route list (development)."],
+      ["/rails/info/properties", "Runtime properties (development)."],
+      ["/assets/*.js.map", "Source maps for original source reconstruction."],
+      ["/packs/*.js.map", "Webpacker source maps."]
+    ],
+    engine: { name: "ERB", test: "<%= 7*7 %>", confirm: "Returns 49 (Ruby).", note: "ERB.new(input).result and render inline: are the classic sinks." },
+    deser: "Ruby Marshal — Base64 BAg / magic \\x04\\x08; also YAML !ruby/object in legacy session cookies (CVE-2022-32224)."
+  },
+  "Django": {
+    recon: [
+      ["/admin/", "Admin login leaks Django version."],
+      ["/admin/login/?next=/", "Admin login."],
+      ["/__debug__/", "django-debug-toolbar (SQL, settings, templates)."],
+      ["/silk/", "django-silk profiler."],
+      ["/api/schema/swagger-ui/", "DRF + drf-spectacular schema."],
+      ["/static/admin/", "Admin static assets confirm Django."]
+    ],
+    engine: { name: "Jinja2 (if integrated)", test: "{{7*7}}", confirm: "Returns 49 only where Jinja2 is used; Django templates are restricted.", note: "SSTI appears when Jinja2 is added alongside Django." },
+    deser: "Python pickle — Base64 gAR / gAN; pickle session backend + SECRET_KEY leak = RCE."
+  },
+  "Laravel": {
+    recon: [
+      ["/.env", "Laravel secrets incl. APP_KEY (session forgery / RCE)."],
+      ["/storage/logs/laravel.log", "Application log; frequent info leak."],
+      ["/telescope", "Telescope debug UI; massive info leak in prod."],
+      ["/horizon", "Queue dashboard."],
+      ["/_ignition/execute-solution", "Ignition RCE (CVE-2021-3129)."],
+      ["/debugbar/open", "Laravel Debugbar."],
+      ["/api/documentation", "L5-Swagger docs."]
+    ],
+    engine: { name: "Blade", test: "{{ 7*7 }}", confirm: "Blade escapes by default; {!! !!} is the raw sink.", note: "SSTI is low-likelihood; focus on {!! !!} raw output." },
+    deser: "PHP serialize() — O:{len}:\"...\" / a:{len}: in cookies/session; APP_KEY leak + unserialize = RCE (CVE-2018-15133)."
+  },
+  "Next.js": {
+    recon: [
+      ["/_next/static/chunks/", "Chunk bundles; often contain API routes and env vars."],
+      ["/_next/image?url=", "Image optimizer; SSRF if domain allowlist is weak."],
+      ["/api/auth/", "NextAuth endpoints."],
+      ["/_next/data/", "getServerSideProps/getStaticProps JSON data."]
+    ],
+    engine: null,
+    deser: "NEXT_PUBLIC_* env vars leak to the client; review middleware auth bypass (CVE-2025-29927) and Server Actions SSRF (CVE-2024-34351)."
+  },
+  "ASP.NET Core": {
+    recon: [
+      ["/swagger", "Swagger UI."],
+      ["/swagger/v1/swagger.json", "OpenAPI schema."],
+      ["/healthchecks-ui", "Health dashboard."],
+      ["/hangfire", "Background-job dashboard; often unauth by default."],
+      ["/appsettings.Production.json", "Production configuration if served."]
+    ],
+    engine: { name: "Razor", test: "@(7*7)", confirm: "Returns 49 only with runtime compilation (rare).", note: "Classic runtime SSTI is effectively absent unless RazorLight-style runtime compilation is used." },
+    deser: ".NET BinaryFormatter — Base64 AAEAAAD///// in __VIEWSTATE/cookies; LosFormatter/ObjectStateFormatter variants."
+  },
+  "Flask/Werkzeug": {
+    recon: [
+      ["/console", "Werkzeug debugger (DEBUG=True) — direct RCE if PIN guessed."],
+      ["/admin/", "Flask-Admin."],
+      ["/api/docs", "Flask-RESTX docs."]
+    ],
+    engine: { name: "Jinja2", test: "{{7*7}}", confirm: "Returns 49; {{7*'7'}} returns 7777777.", note: "render_template_string(user_input) is a well-known RCE primitive." },
+    deser: "Python pickle — gAR / gAN in pickle-based sessions; SECRET_KEY leak = session forgery."
+  },
+  "FastAPI": {
+    recon: [
+      ["/docs", "Swagger UI."],
+      ["/redoc", "ReDoc."],
+      ["/openapi.json", "Schema — check even when /docs is disabled."],
+      ["/health", "Health endpoint."],
+      ["/metrics", "Prometheus metrics."]
+    ],
+    engine: { name: "Jinja2 (if templating used)", test: "{{7*7}}", confirm: "Only where fastapi.templating/Jinja2 is used.", note: "Most FastAPI apps are JSON APIs with no templating." },
+    deser: "No built-in CSRF for cookie auth; review JWT (alg:none / weak secret) and raw SQLAlchemy text()."
+  },
+  "NestJS": {
+    recon: [
+      ["/api", "Common global prefix."],
+      ["/api-docs", "SwaggerModule docs."],
+      ["/graphql", "GraphQLModule; test introspection."],
+      ["/health", "Terminus health module."]
+    ],
+    engine: null,
+    deser: "node-serialize marker _$$ND_FUNC$$_ if that library is used; ValidationPipe without whitelist:true enables mass assignment."
+  },
+  "Nuxt.js": {
+    recon: [
+      ["/_nuxt/", "Static assets; check for source maps."],
+      ["/api/_content/", "@nuxt/content query endpoint."],
+      ["/__nuxt_devtools__/", "Dev tools, sometimes leaked in prod."],
+      ["/server/api/", "Server route surface to enumerate."]
+    ],
+    engine: null,
+    deser: "runtimeConfig.public leaks; SSR __NUXT__ hydration data often leaks API responses and user data."
+  },
+  "Go web framework": {
+    recon: [
+      ["/debug/pprof/", "Go profiler; goroutine/heap/CPU dumps leak memory."],
+      ["/debug/pprof/heap", "Heap profile."],
+      ["/metrics", "Prometheus metrics."],
+      ["/swagger/index.html", "swaggo docs."]
+    ],
+    engine: { name: "text/template vs html/template", test: "{{7*7}}", confirm: "Returns 49 when template string is user-controlled.", note: "Importing text/template instead of html/template causes XSS/SSTI." },
+    deser: "encoding/xml XXE and json.Unmarshal type confusion; no deserialization magic bytes on the wire."
+  },
+  "Symfony": {
+    recon: [
+      ["/_profiler/", "Profiler — full request/response/SQL/session access."],
+      ["/_profiler/phpinfo", "phpinfo via profiler."],
+      ["/app_dev.php", "Legacy dev front controller."],
+      ["/_fragment", "ESI fragment; RCE via _controller if unsigned."]
+    ],
+    engine: { name: "Twig", test: "{{7*7}}", confirm: "Returns 49; {{7*'7'}} returns 49 (vs 7777777 for Jinja2).", note: "Twig SSTI via user input in template strings." },
+    deser: "PHP serialize() — O:/a: markers; CVE-2019-10912 PhpBridgeSessionStorage deserialization."
+  },
+  "Apache Struts": {
+    recon: [
+      ["/index.action", "Struts action endpoint; test OGNL vectors manually."],
+      ["/struts/webconsole.html", "Struts console if enabled."]
+    ],
+    engine: { name: "OGNL", test: "${7*7} / %{7*7}", confirm: "OGNL evaluation in parameter names, Content-Type, or namespace.", note: "Signature RCE class: CVE-2017-5638, CVE-2018-11776, CVE-2020-17530." },
+    deser: "Java XStream (REST plugin, CVE-2017-9805) and ObjectOutputStream rO0AB values."
+  },
+  "ColdFusion": {
+    recon: [
+      ["/CFIDE/administrator/", "Admin panel; multiple unauth RCEs."],
+      ["/CFIDE/administrator/enter.cfm", "Admin login."],
+      ["/CFIDE/adminapi/", "Admin API."],
+      ["/CFIDE/componentutils/", "Component utilities."],
+      ["/cf_scripts/", "CF script assets confirm ColdFusion."]
+    ],
+    engine: { name: "CFML", test: "#7*7#", confirm: "CFML tag/expression evaluation on user input.", note: "SSRF via <cfhttp>, LFI via <cffile>/<cfinclude>." },
+    deser: "Java deserialization in CF runtime; CVE-2023-26360 access-control bypass + RCE."
+  },
+  "Express.js": {
+    recon: [
+      ["/api-docs", "swagger-jsdoc/OpenAPI docs if mounted."]
+    ],
+    engine: { name: "EJS / Handlebars / Pug", test: "{{7*7}} or <%= 7*7 %> or #{7*7}", confirm: "Depends on the view engine in use.", note: "Handlebars/EJS SSTI when a template engine renders unsanitized input." },
+    deser: "node-serialize marker _$$ND_FUNC$$_ if that library is used."
+  },
+  "Node.js": {
+    recon: [],
+    engine: { name: "EJS / Pug / Handlebars", test: "<%= 7*7 %> / #{7*7} / {{7*7}}", confirm: "Depends on the template engine.", note: "Dynamic template rendering on user input is the sink." },
+    deser: "node-serialize marker _$$ND_FUNC$$_ if that library is used."
+  }
+};
+
+// Frameworks that imply a specific config/leak path worth adding to the hunt list.
+const frameworkConfigLeaks = {
+  "Ruby on Rails": [["/config/master.key", "Decrypts credentials.yml.enc = full compromise."], ["/config/database.yml", "Database credentials."]],
+  "Django": [["/settings.py", "Django settings incl. SECRET_KEY if served."], ["/local_settings.py", "Local settings override."]],
+  "Laravel": [["/.env.backup", "Backup of Laravel secrets."], ["/composer.json", "Dependency inventory."]],
+  "WordPress": [["/wp-config.php", "WordPress DB creds and keys."], ["/wp-config.php.bak", "Backup of wp-config."]],
+  "Drupal": [["/sites/default/settings.php", "Drupal DB creds."]],
+  "Joomla": [["/configuration.php", "Joomla configuration."]],
+  "Spring Boot": [["/application.properties", "Spring configuration."], ["/application-prod.yml", "Production profile config."]],
+  "ASP.NET Core": [["/web.config", "IIS configuration."], ["/appsettings.json", "Application configuration."]]
+};
+
+function buildReconChecklist(fingerprints) {
+  const names = (fingerprints || []).map(item => item.name);
+  const reconSeen = new Set();
+  const reconEndpoints = [];
+  const engineHints = [];
+  const engineSeen = new Set();
+  const deserHints = [];
+  const deserSeen = new Set();
+  const configSeen = new Set();
+  const configLeaks = [];
+  const dangerousEndpoints = genericDangerousEndpoints.map(([path, why]) => ({ path, why }));
+  for (const [path, why] of genericConfigLeakPaths) {
+    if (configSeen.has(path)) continue;
+    configSeen.add(path);
+    configLeaks.push({ path, why, framework: "General" });
+  }
+  for (const name of names) {
+    const entry = frameworkRecon[name];
+    if (entry) {
+      for (const [path, why] of entry.recon || []) {
+        const key = `${path}|${why}`;
+        if (reconSeen.has(key)) continue;
+        reconSeen.add(key);
+        reconEndpoints.push({ framework: name, path, why });
+      }
+      if (entry.engine && !engineSeen.has(entry.engine.name)) {
+        engineSeen.add(entry.engine.name);
+        engineHints.push({ framework: name, ...entry.engine });
+      }
+      if (entry.deser && !deserSeen.has(entry.deser)) {
+        deserSeen.add(entry.deser);
+        deserHints.push({ framework: name, note: entry.deser });
+      }
+    }
+    for (const [path, why] of frameworkConfigLeaks[name] || []) {
+      if (configSeen.has(path)) continue;
+      configSeen.add(path);
+      configLeaks.push({ path, why, framework: name });
+    }
+  }
+  return { reconEndpoints, configLeaks, dangerousEndpoints, engineHints, deserHints };
+}
+
 function normalizeModulePath(value) {
   const raw = String(value || "").trim();
   if (!raw.startsWith("/") || raw.startsWith("//") || /[?#\\\u0000-\u001f]/.test(raw)) {
@@ -3041,6 +3298,7 @@ async function scan() {
       inputFields,
       parameterReviews,
       routeTestIdeas: routeTestIdeas(routesForIdeas, fingerprints),
+      reconChecklist: buildReconChecklist(fingerprints),
       observedTraffic,
       externalScriptHosts: [...externalScriptHosts].sort(),
       jsFiles: [...new Set([...scriptUrls].map(reportUrl))].sort(),
@@ -3205,7 +3463,7 @@ function sanitizeStoredReport(rawReport) {
   const allowedFields = [
     "id", "createdAt", "origin", "scope", "stats", "fingerprints", "headers", "pages", "routeCandidates",
     "transportEndpoints", "formActions", "nonGetCallSites", "graphqlOperations", "technologyVersions", "requestIssues",
-    "unresolvedImports", "uiModules", "inputFields", "parameterReviews", "routeTestIdeas", "observedTraffic",
+    "unresolvedImports", "uiModules", "inputFields", "parameterReviews", "routeTestIdeas", "reconChecklist", "observedTraffic",
     "externalScriptHosts", "jsFiles", "scriptIndicators", "endpoints", "anonymousChecks", "anonymousPageChecks",
     "withheldRequests", "testIdeas", "limitations"
   ];
@@ -3435,6 +3693,19 @@ function sanitizeStoredReport(rawReport) {
     name: text(item.name, 200), source: authorizedAssetOrText(item.source), kind: text(item.kind, 100), method: text(item.method, 16), idea: text(item.idea, 1000)
   }));
   report.testIdeas = objectList(report.testIdeas).map(item => ({ relevance: text(item.relevance, 100), category: text(item.category, 200), details: text(item.details, 1000) }));
+  const reconIn = isRecord(report.reconChecklist) ? report.reconChecklist : {};
+  const originRelativePath = value => {
+    const raw = text(value, 512);
+    if (!raw || !raw.startsWith("/") || raw.startsWith("//") || /[\u0000-\u001f\\]/.test(raw)) return "";
+    return raw;
+  };
+  report.reconChecklist = {
+    reconEndpoints: objectList(reconIn.reconEndpoints).map(item => ({ framework: text(item.framework, 80), path: originRelativePath(item.path), why: text(item.why, 300) })).filter(item => item.path).slice(0, 400),
+    configLeaks: objectList(reconIn.configLeaks).map(item => ({ framework: text(item.framework, 80), path: originRelativePath(item.path), why: text(item.why, 300) })).filter(item => item.path).slice(0, 400),
+    dangerousEndpoints: objectList(reconIn.dangerousEndpoints).map(item => ({ path: originRelativePath(item.path), why: text(item.why, 300) })).filter(item => item.path).slice(0, 200),
+    engineHints: objectList(reconIn.engineHints).map(item => ({ framework: text(item.framework, 80), name: text(item.name, 120), test: text(item.test, 120), confirm: text(item.confirm, 300), note: text(item.note, 300) })).slice(0, 50),
+    deserHints: objectList(reconIn.deserHints).map(item => ({ framework: text(item.framework, 80), note: text(item.note, 400) })).slice(0, 50)
+  };
   report.fingerprints = objectList(report.fingerprints).map(item => ({
     name: text(item.name, 200), confidence: text(item.confidence, 80), score: count(item.score)
   }));
@@ -3742,7 +4013,14 @@ function render(tabName) {
     const baseRouteIdeas = report.routeTestIdeas || [];
     const liveRoutes = observedItems.map(item => ({ url: reportUrl(item.url), method: item.method }));
     const routeIdeas = [...baseRouteIdeas, ...routeTestIdeas(liveRoutes, report.fingerprints || [])];
-    panel.innerHTML = `${routeIdeas.length ? `<div class="card"><h3>Route-specific TBHM review ideas</h3><p class="muted">Each item points to a discovered route or observed method. These are manual review prompts; no attack payloads are sent.</p>${routeIdeas.map(idea => `<div class="idea"><span class="pill">${escapeHtml(idea.method)}</span><span class="pill">TBHM: ${escapeHtml(idea.tbhmCategory)}</span><b>${escapeHtml(idea.category)}</b><div class="endpoint">${escapeHtml(idea.url)}</div><p>${escapeHtml(idea.details)}</p><small>Fingerprint context: ${escapeHtml(idea.framework)}</small></div>`).join("")}</div>` : ""}<div class="card"><h3>TBHM-aligned manual test ideas</h3><p class="muted">Framework-specific ideas are shown first, followed by general bug classes from TBHM. These are review leads, not confirmed vulnerabilities. No payloads are sent by this extension.</p>${report.testIdeas.map(idea => `<div class="idea"><span class="pill">${escapeHtml(idea.relevance)}</span><b>${escapeHtml(idea.category)}</b><p>${escapeHtml(idea.details)}</p></div>`).join("")}</div><div class="card"><h3>Safe use notes</h3>Use written authorization, dedicated test accounts, and reversible checks. Do not retrieve exposed secrets, heap dumps, or other users' data.</div>`;
+    const recon = report.reconChecklist || { reconEndpoints: [], configLeaks: [], dangerousEndpoints: [], engineHints: [], deserHints: [] };
+    const reconRow = item => `<div class="idea"><span class="pill">${escapeHtml(item.framework || "General")}</span><div class="endpoint">${escapeHtml(report.origin + item.path)}</div><p>${escapeHtml(item.why)}</p></div>`;
+    const reconCard = recon.reconEndpoints?.length ? `<div class="card"><h3>Fingerprint-based recon endpoints</h3><p class="muted">Suggested from detected frameworks. StackScope did not request these; check them manually within authorized scope. Presence of a path is not a finding.</p>${recon.reconEndpoints.map(reconRow).join("")}</div>` : "";
+    const leakCard = recon.configLeaks?.length ? `<div class="card"><h3>Config / secret leak paths to review</h3><p class="muted">Common configuration and secret paths. StackScope does not fetch these; review manually only where your authorization allows.</p>${recon.configLeaks.map(reconRow).join("")}</div>` : "";
+    const dangerCard = recon.dangerousEndpoints?.length ? `<div class="card"><h3>Default dangerous endpoints to review</h3><p class="muted">Generic high-value paths. Manual review leads only; not requested by the extension.</p>${recon.dangerousEndpoints.map(item => `<div class="idea"><div class="endpoint">${escapeHtml(report.origin + item.path)}</div><p>${escapeHtml(item.why)}</p></div>`).join("")}</div>` : "";
+    const engineCard = recon.engineHints?.length ? `<div class="card"><h3>Template-engine SSTI leads</h3><p class="muted">Inferred from fingerprints. Confirmation payloads are shown for manual testing only; StackScope never sends them.</p>${recon.engineHints.map(item => `<div class="idea"><span class="pill">${escapeHtml(item.framework)}</span><b>${escapeHtml(item.name)}</b><div>Probe (manual): <code>${escapeHtml(item.test)}</code></div><p>${escapeHtml(item.confirm)}</p>${item.note ? `<small>${escapeHtml(item.note)}</small>` : ""}</div>`).join("")}</div>` : "";
+    const deserCard = recon.deserHints?.length ? `<div class="card"><h3>Deserialization / token review</h3><p class="muted">What to look for in cookies, tokens, and bodies during manual review. StackScope stores no values, so inspect these yourself.</p>${recon.deserHints.map(item => `<div class="idea"><span class="pill">${escapeHtml(item.framework)}</span><p>${escapeHtml(item.note)}</p></div>`).join("")}</div>` : "";
+    panel.innerHTML = `${routeIdeas.length ? `<div class="card"><h3>Route-specific TBHM review ideas</h3><p class="muted">Each item points to a discovered route or observed method. These are manual review prompts; no attack payloads are sent.</p>${routeIdeas.map(idea => `<div class="idea"><span class="pill">${escapeHtml(idea.method)}</span><span class="pill">TBHM: ${escapeHtml(idea.tbhmCategory)}</span><b>${escapeHtml(idea.category)}</b><div class="endpoint">${escapeHtml(idea.url)}</div><p>${escapeHtml(idea.details)}</p><small>Fingerprint context: ${escapeHtml(idea.framework)}</small></div>`).join("")}</div>` : ""}${reconCard}${leakCard}${dangerCard}${engineCard}${deserCard}<div class="card"><h3>TBHM-aligned manual test ideas</h3><p class="muted">Framework-specific ideas are shown first, followed by general bug classes from TBHM. These are review leads, not confirmed vulnerabilities. No payloads are sent by this extension.</p>${report.testIdeas.map(idea => `<div class="idea"><span class="pill">${escapeHtml(idea.relevance)}</span><b>${escapeHtml(idea.category)}</b><p>${escapeHtml(idea.details)}</p></div>`).join("")}</div><div class="card"><h3>Safe use notes</h3>Use written authorization, dedicated test accounts, and reversible checks. Do not retrieve exposed secrets, heap dumps, or other users' data.</div>`;
   }
 }
 
